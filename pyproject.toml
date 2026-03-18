@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lean-tree-tools"
+version = "0.1.0"
+description = "Sorry dependency tracker and type signature extractor for Lean 4 projects"
+requires-python = ">=3.10"
+license = "MIT"
+
+[project.scripts]
+sorry-tree = "lean_tree.sorry.cli:main"
+sig-tree = "lean_tree.sig.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["lean_tree*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
