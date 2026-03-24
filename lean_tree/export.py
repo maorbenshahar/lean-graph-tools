@@ -11,8 +11,8 @@ from pathlib import Path
 from typing import Optional
 
 
-EXPORT_DECLS_LEAN = Path(__file__).resolve().parent.parent / "lean" / "ExportDecls.lean"
-EXPORT_SIGS_LEAN = Path(__file__).resolve().parent.parent / "lean" / "ExportSigs.lean"
+EXPORT_DECLS_LEAN = Path(__file__).resolve().parent / "lean" / "ExportDecls.lean"
+EXPORT_SIGS_LEAN = Path(__file__).resolve().parent / "lean" / "ExportSigs.lean"
 
 
 def run_lean_export(
