@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lean-tree-tools"
-version = "0.1.1"
+version = "0.2.0"
 description = "Sorry dependency tracker and type signature extractor for Lean 4 projects"
 requires-python = ">=3.10"
 license = "MIT"
@@ -12,6 +12,9 @@ license = "MIT"
 [project.scripts]
 sorry-tree = "lean_tree.sorry.cli:main"
 sig-tree = "lean_tree.sig.cli:main"
+downstream-tree = "lean_tree.downstream.cli:downstream_main"
+upstream-tree = "lean_tree.downstream.cli:upstream_main"
+dep-connected = "lean_tree.downstream.cli:connected_main"
 
 [tool.setuptools.packages.find]
 include = ["lean_tree*"]

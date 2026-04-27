@@ -1,6 +1,7 @@
 # lean-tree-tools
 
-Analysis tools for Lean 4 projects: sorry dependency tracking and type signature extraction.
+Analysis tools for Lean 4 projects: sorry dependency tracking, reverse
+dependency tracking, connectivity checks, and type signature extraction.
 
 ## Tools
 
@@ -63,6 +64,42 @@ sig-tree -f MyModule -o context.lean
 sig-tree -f MyModule --json
 ```
 
+### upstream-tree / downstream-tree
+
+Shows all declarations upstream or downstream of a given declaration. The input is any
+project declaration exported by Lean: theorems, defs, structures/classes,
+inductives, instances, opaque defs, and projections. Output includes everything
+by default, not just downstream theorems.
+
+This is useful when solving a low-level `sorry`: it shows the declarations that
+may become cleaner or newly sorry-free once the target is proved.
+
+```bash
+# All transitive upstream dependencies
+upstream-tree MyProject.Top.mainTheorem
+
+# All transitive downstream declarations
+downstream-tree MyProject.Core.keyLemma
+
+# Only direct dependencies/users
+upstream-tree MyProject.Top.mainTheorem --direct
+downstream-tree MyProject.Core.keyLemma --direct
+
+# JSON output
+upstream-tree MyProject.Top.mainTheorem --json
+downstream-tree MyProject.Core.keyLemma --json
+```
+
+### dep-connected
+
+Checks whether either of two declarations depends on the other and prints a
+shortest dependency path when one exists.
+
+```bash
+dep-connected MyProject.Top.mainTheorem MyProject.Core.keyLemma
+dep-connected MyProject.Type.SomeStruct MyProject.Algebra.someFunction --json
+```
+
 Example output:
 ```
 -- ==============================================================
@@ -98,7 +135,8 @@ structure MState (n : ℕ) where
 pip install -e /path/to/lean-tree-tools
 ```
 
-Both `sorry-tree` and `sig-tree` commands are installed.
+The `sorry-tree`, `sig-tree`, `downstream-tree`, `upstream-tree`, and
+`dep-connected` commands are installed.
 
 ## Shared options
 
@@ -110,6 +148,7 @@ Both tools support:
 | `-m, --module` | Root module name (auto-detected from lakefile) |
 | `-l, --load` | Load from a cached JSON export |
 | `-s, --save` | Save export to a JSON file |
+| `--max-depth` | Limit dependency distance (supported by downstream tools) |
 | `--json` | JSON output |
 
 Caching: exports are stored in `.lake/` and only regenerated when oleans change.

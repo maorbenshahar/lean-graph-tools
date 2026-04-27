@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from ..common import _private_short_name, module_short
+from ..graph import DeclarationGraph
 
 
 @dataclass
@@ -42,31 +43,30 @@ def build_index(data: dict) -> dict[str, DeclInfo]:
 # BFS and sorry analysis
 # ---------------------------------------------------------------------------
 
-def transitive_deps(index: dict[str, DeclInfo], target: str) -> list[DeclInfo]:
+def transitive_deps(
+    index: dict[str, DeclInfo],
+    target: str,
+    graph: DeclarationGraph | None = None,
+) -> list[DeclInfo]:
     """Compute transitive dependency closure via BFS."""
-    visited: set[str] = set()
-    queue = [target]
-    order: list[DeclInfo] = []
-
-    while queue:
-        name = queue.pop(0)
-        if name in visited:
-            continue
-        visited.add(name)
-        if name in index:
-            order.append(index[name])
-            for dep in index[name].deps:
-                if dep not in visited:
-                    queue.append(dep)
-
-    return order
+    graph = graph or DeclarationGraph(index)
+    return [
+        index[name]
+        for name in graph.closure_names(
+            [target],
+            "dependencies",
+            include_roots=True,
+        )
+    ]
 
 
 def has_transitive_sorry(name: str, index: dict[str, DeclInfo],
-                         memo: Optional[dict[str, bool]] = None) -> bool:
+                         memo: Optional[dict[str, bool]] = None,
+                         graph: DeclarationGraph | None = None) -> bool:
     """Check if a declaration has sorry or depends transitively on one."""
     if memo is None:
         memo = {}
+    graph = graph or DeclarationGraph(index)
     if name in memo:
         return memo[name]
     if name not in index:
@@ -80,8 +80,8 @@ def has_transitive_sorry(name: str, index: dict[str, DeclInfo],
 
     # Prevent infinite recursion on cycles
     memo[name] = False
-    for dep in decl.deps:
-        if has_transitive_sorry(dep, index, memo):
+    for dep in graph.neighbors(name, "dependencies"):
+        if has_transitive_sorry(dep, index, memo, graph=graph):
             memo[name] = True
             return True
 
@@ -125,13 +125,15 @@ def analyze_target(index: dict[str, DeclInfo], target: str,
                    show_tree: bool = True,
                    lake_root: Optional[str] = None) -> TrackerResult:
     """Analyze a target declaration and return its sorry dependency info."""
-    closure = transitive_deps(index, target)
+    graph = DeclarationGraph(index)
+    closure = transitive_deps(index, target, graph=graph)
     closure_index = {d.name: d for d in closure}
+    closure_graph = DeclarationGraph(closure_index)
 
     # Compute transitive sorry status
     memo: dict[str, bool] = {}
     for d in closure:
-        has_transitive_sorry(d.name, closure_index, memo)
+        has_transitive_sorry(d.name, closure_index, memo, graph=closure_graph)
 
     # Find axioms
     axioms = [d.name for d in closure if d.kind == "axiom"]
@@ -148,7 +150,7 @@ def analyze_target(index: dict[str, DeclInfo], target: str,
 
     tree = ""
     if show_tree and (sorry_leaves or axioms):
-        tree = render_tree(target, closure_index, memo)
+        tree = render_tree(target, closure_index, memo, graph=closure_graph)
 
     return TrackerResult(
         target=target,
@@ -172,15 +174,22 @@ def analyze_scope(index: dict[str, DeclInfo], decls: list[DeclInfo],
     all_axioms: set[str] = set()
     all_closure_names: set[str] = set()
     sorry_decl_names: list[str] = []
+    graph = DeclarationGraph(index)
 
     for d in decls:
         if not d.has_sorry:
             continue
-        result = analyze_target(index, d.name, show_tree=False, lake_root=lake_root)
-        for leaf in result.sorry_leaves:
-            all_sorry_leaves[leaf.name] = leaf
-        all_axioms.update(result.axioms)
-        all_closure_names.update(d2.name for d2 in transitive_deps(index, d.name))
+        closure = transitive_deps(index, d.name, graph=graph)
+        for d2 in closure:
+            all_closure_names.add(d2.name)
+            if d2.kind == "axiom":
+                all_axioms.add(d2.name)
+            if d2.contains_sorry:
+                all_sorry_leaves[d2.name] = SorryLeaf(
+                    name=d2.name, module=d2.module,
+                    file=module_to_path(d2.module, lake_root),
+                    line=d2.line, is_private=d2.is_private,
+                )
         sorry_decl_names.append(d.name)
 
     sorry_leaves = list(all_sorry_leaves.values())
@@ -190,13 +199,19 @@ def analyze_scope(index: dict[str, DeclInfo], decls: list[DeclInfo],
         # Build combined closure + memo for rendering
         combined_index: dict[str, DeclInfo] = {}
         for name in sorry_decl_names:
-            for d2 in transitive_deps(index, name):
+            for d2 in transitive_deps(index, name, graph=graph):
                 combined_index[d2.name] = d2
+        combined_graph = DeclarationGraph(combined_index)
         memo: dict[str, bool] = {}
         for d2 in combined_index.values():
-            has_transitive_sorry(d2.name, combined_index, memo)
+            has_transitive_sorry(d2.name, combined_index, memo, graph=combined_graph)
 
-        tree = render_scope_tree(sorry_decl_names, combined_index, memo)
+        tree = render_scope_tree(
+            sorry_decl_names,
+            combined_index,
+            memo,
+            graph=combined_graph,
+        )
 
     return TrackerResult(
         target=f"[{len(decls)} declarations]",
@@ -221,10 +236,12 @@ def display_name(decl: DeclInfo) -> str:
 
 
 def _render_tree(roots: list[str], index: dict[str, DeclInfo],
-                 memo: dict[str, bool]) -> str:
+                 memo: dict[str, bool],
+                 graph: DeclarationGraph | None = None) -> str:
     """Render ASCII dependency tree showing sorry branches."""
     lines: list[str] = []
     visited: set[str] = set()
+    graph = graph or DeclarationGraph(index)
 
     def _walk(name: str, prefix: str, is_last: bool) -> None:
         connector = "\u2514\u2500 " if is_last else "\u251c\u2500 "
@@ -239,7 +256,10 @@ def _render_tree(roots: list[str], index: dict[str, DeclInfo],
             return
 
         decl = index[name]
-        issue_deps = [dep for dep in decl.deps if memo.get(dep, False)]
+        issue_deps = [
+            dep for dep in graph.neighbors(name, "dependencies")
+            if memo.get(dep, False)
+        ]
 
         tag = ""
         if decl.contains_sorry:
@@ -264,12 +284,14 @@ def _render_tree(roots: list[str], index: dict[str, DeclInfo],
 
 
 def render_tree(target: str, index: dict[str, DeclInfo],
-                memo: dict[str, bool]) -> str:
+                memo: dict[str, bool],
+                graph: DeclarationGraph | None = None) -> str:
     """Render an ASCII dependency tree showing sorry branches."""
-    return _render_tree([target], index, memo)
+    return _render_tree([target], index, memo, graph=graph)
 
 
 def render_scope_tree(roots: list[str], index: dict[str, DeclInfo],
-                      memo: dict[str, bool]) -> str:
+                      memo: dict[str, bool],
+                      graph: DeclarationGraph | None = None) -> str:
     """Render combined sorry tree for multiple roots, sharing visited set."""
-    return _render_tree(roots, index, memo)
+    return _render_tree(roots, index, memo, graph=graph)

@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from ..common import _private_short_name, module_short
+from ..graph import DeclarationGraph
 
 
 @dataclass
@@ -88,24 +89,15 @@ def dep_closure(index: dict[str, DeclInfo],
     Gives the set of declarations needed to understand what every
     declaration means and computes.
     """
-    visited: set[str] = set()
-    queue = list(targets)
-    order: list[DeclInfo] = []
-
-    while queue:
-        name = queue.pop(0)
-        if name in visited:
-            continue
-        visited.add(name)
-        if name not in index:
-            continue
-        decl = index[name]
-        order.append(decl)
-        for dep in decl.deps:
-            if dep not in visited:
-                queue.append(dep)
-
-    return order
+    graph = DeclarationGraph(index)
+    return [
+        index[name]
+        for name in graph.closure_names(
+            targets,
+            "dependencies",
+            include_roots=True,
+        )
+    ]
 
 
 def display_name(decl: DeclInfo) -> str:
