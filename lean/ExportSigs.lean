@@ -13,7 +13,8 @@
   Only follows project-local dependencies. External library declarations
   (Mathlib/Init/Std) are excluded from deps.
 
-  Auto-generated sub-declarations are merged into parents (same as sorry-tree).
+  Auto-generated sub-declarations are skipped from rendered signature context;
+  duplicate declarations observed through multiple modules are emitted once.
 -/
 import Lean
 
@@ -601,6 +602,7 @@ unsafe def main : List String → IO Unit := fun args => do
 
   -- Build JSON
   let mut decls : Array Json := #[]
+  let mut emittedNames : NameHashSet := {}
 
   for i in [:mods.size] do
     if mods[i]!.getRoot != rootName then continue
@@ -609,8 +611,10 @@ unsafe def main : List String → IO Unit := fun args => do
 
     for j in [:md.constNames.size] do
       let name := md.constNames[j]!
+      if emittedNames.contains name then continue
+      emittedNames := emittedNames.insert name
 
-      -- Skip auto-generated sub-declarations (merged into parent)
+      -- Skip auto-generated sub-declarations from rendered signature context.
       if name.isInternalDetail then
         if (declRangeExt.find? env name).isNone then
           if (findParent name projectNames).isSome then continue

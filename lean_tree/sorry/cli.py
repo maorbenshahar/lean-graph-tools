@@ -5,7 +5,15 @@ import json
 import sys
 from pathlib import Path
 
-from ..common import detect_root_module, find_by_module, find_decl, log, module_short
+from ..common import (
+    add_export_timeout_arg,
+    detect_root_module,
+    export_timeout_from_args,
+    find_by_module,
+    find_decl,
+    log,
+    module_short,
+)
 from ..export import (
     EXPORT_DECLS_LEAN,
     export_cached,
@@ -66,14 +74,20 @@ def _print_json(result: TrackerResult) -> None:
     }, indent=2))
 
 
-def _load_index(args, lake_root, root_module):
+def _load_index(args, lake_root, root_module, parser):
     """Load declaration database and build index."""
     if args.load:
         log(f"Loading from {args.load}...")
         data = load_from_file(Path(args.load))
     else:
         cache_path = lake_root / ".lake" / "decls_cache.json"
-        data = export_cached(lake_root, root_module, cache_path, EXPORT_DECLS_LEAN)
+        data = export_cached(
+            lake_root,
+            root_module,
+            cache_path,
+            EXPORT_DECLS_LEAN,
+            timeout=export_timeout_from_args(args, parser),
+        )
 
     recompute_transitive_sorry(data)
 
@@ -127,6 +141,7 @@ def main():
         "--json", action="store_true",
         help="Output results as JSON",
     )
+    add_export_timeout_arg(parser)
     args = parser.parse_args()
 
     if not args.target and not args.file and not args.all:
@@ -143,7 +158,7 @@ def main():
         log("ERROR: Could not detect root module. Use --module.")
         sys.exit(1)
 
-    index = _load_index(args, lake_root, root_module)
+    index = _load_index(args, lake_root, root_module, parser)
 
     # --- File/module scope ---
     if args.file:

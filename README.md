@@ -9,7 +9,7 @@ dependency tracking, connectivity checks, and type signature extraction.
 
 Finds which declarations transitively depend on `sorry` and shows the dependency tree.
 
-1. `ExportDecls.lean` extracts all declarations with their dependencies and sorry status into cached JSON. Requires oleans (`lake build`). Auto-generated sub-declarations (`_proof_N`, `eq_N`, `match_N`) are merged into their parent.
+1. `ExportDecls.lean` extracts all project-local declarations with their dependencies and sorry status into cached JSON. Requires oleans (`lake build`). Internal and auto-generated declarations are kept as graph nodes so dependency paths are not hidden or truncated.
 2. `tracker.py` walks the dependency graph via BFS, finding all paths to `sorry`.
 
 ```bash
@@ -140,7 +140,7 @@ The `sorry-tree`, `sig-tree`, `downstream-tree`, `upstream-tree`, and
 
 ## Shared options
 
-Both tools support:
+The CLIs share these options where applicable:
 
 | Flag | Description |
 |------|-------------|
@@ -150,8 +150,10 @@ Both tools support:
 | `-s, --save` | Save export to a JSON file |
 | `--max-depth` | Limit dependency distance (supported by downstream tools) |
 | `--json` | JSON output |
+| `--timeout` | Lean export timeout in seconds; defaults to no timeout, and `0` disables it explicitly |
 
-Caching: exports are stored in `.lake/` and only regenerated when oleans change.
+Caching: exports are stored in `.lake/` and regenerated when project oleans,
+exporter scripts, or cached module membership change.
 
 ## License
 

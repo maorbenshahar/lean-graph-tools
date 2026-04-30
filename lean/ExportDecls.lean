@@ -8,9 +8,10 @@
   Output: JSON with declaration name, kind, module, sorry status,
   privacy, and actual declaration-level dependencies (not file-level imports).
 
-  Auto-generated sub-declarations (_proof_N, eq_N, match_N, etc.) are merged
-  into their parent: their sorry status and deps are absorbed by the parent.
-  This means consumers never see internal artifacts.
+  This is the canonical project-local declaration graph for the tree tools.
+  It intentionally keeps internal and auto-generated project declarations as
+  graph nodes. Consumers may choose compact renderings, but the export itself
+  should not delete or truncate dependency paths.
 
   Key optimisation: only follows project-local dependencies (skips Mathlib/Init/
   Std/etc via the projectNames set). Since external libraries are sorry-free,
@@ -25,9 +26,9 @@ import Lean
 open Lean
 
 def getKind (ci : ConstantInfo) : Option String := match ci with
-  | .ctorInfo _  => none
-  | .recInfo _   => none
-  | .quotInfo _  => none
+  | .ctorInfo _  => some "constructor"
+  | .recInfo _   => some "recursor"
+  | .quotInfo _  => some "quot"
   | .defnInfo _  => some "def"
   | .thmInfo _   => some "theorem"
   | .axiomInfo _  => some "axiom"
@@ -47,14 +48,6 @@ def getAllConstants (ci : ConstantInfo) : Array Name :=
 /-- Check if a declaration contains a literal sorryAx in its type or value. -/
 def containsSorryAx (ci : ConstantInfo) : Bool :=
   (getAllConstants ci).contains ``sorryAx
-
-/-- Find the parent name for a sub-declaration by stripping the last component.
-    Returns `none` if stripping doesn't yield a valid project name. -/
-def findParent (name : Name) (projectNames : NameHashSet) : Option Name :=
-  match name with
-  | .str parent _ =>
-    if projectNames.contains parent then some parent else none
-  | _ => none
 
 /-- Compute transitive sorry status for all project declarations.
 
@@ -82,11 +75,6 @@ partial def hasSorryTransitive (env : Environment) (projectNames : NameHashSet)
       memo.modify (·.insert name true)
       return true
   return false
-
-/-- Data accumulated for a parent declaration from its sub-declarations. -/
-structure MergedData where
-  extraDeps : Array Name := #[]
-  childHasSorry : Bool := false
 
 unsafe def main : List String → IO Unit := fun args => do
   let rootModuleStr ← match args.head? with
@@ -119,54 +107,21 @@ unsafe def main : List String → IO Unit := fun args => do
     let _ ← hasSorryTransitive env projectNames memo name
   let sorryMap ← memo.get
 
-  -- First pass: find sub-declarations and merge their data into parents
-  let mut mergedMap : NameMap MergedData := {}
-
-  for name in projectNames.toArray do
-    if !name.isInternalDetail then continue
-    -- Only merge truly auto-generated decls (no source location).
-    -- Private user declarations (_private.*) have declRange and should be kept.
-    if (declRangeExt.find? env name).isSome then continue
-    let some parent := findParent name projectNames | continue
-    let some cinfo := env.find? name | continue
-
-    let childSorry := containsSorryAx cinfo
-    let childDeps := getAllConstants cinfo
-
-    let prev := mergedMap.find? parent |>.getD {}
-    mergedMap := mergedMap.insert parent {
-      extraDeps := prev.extraDeps ++ childDeps
-      childHasSorry := prev.childHasSorry || childSorry
-    }
-
-  -- Helper: collect deps for a declaration (including merged sub-decl deps)
+  -- Helper: collect deps for a declaration.
   let collectDeps := fun (name : Name) (cinfo : ConstantInfo) => do
-    let ownConsts := getAllConstants cinfo
-    let mergedConsts := match mergedMap.find? name with
-      | some md => md.extraDeps
-      | none => #[]
-    let allConsts := ownConsts ++ mergedConsts
-
     let mut seen : NameHashSet := {}
     let mut projectDeps : Array String := #[]
-    for c in allConsts do
+    for c in getAllConstants cinfo do
       if c == name || c == ``sorryAx then continue
       if !projectNames.contains c then continue
       if seen.contains c then continue
-      -- Skip sub-declarations (they're merged into parents)
-      if c.isInternalDetail && (findParent c projectNames).isSome then continue
-      -- Skip internal deps UNLESS they have sorry (sorry blockers must be visible)
-      if c.isInternal then
-        let cHasSorry := match sorryMap.find? c with
-          | some v => v
-          | none => false
-        if !cHasSorry then continue
       seen := seen.insert c
       projectDeps := projectDeps.push c.toString
     pure projectDeps
 
-  -- Build JSON — skip sub-declarations
+  -- Build JSON for every project-local declaration with a ConstantInfo kind.
   let mut decls : Array Json := #[]
+  let mut emittedNames : NameHashSet := {}
 
   for i in [:mods.size] do
     if mods[i]!.getRoot != rootName then continue
@@ -175,11 +130,8 @@ unsafe def main : List String → IO Unit := fun args => do
 
     for j in [:md.constNames.size] do
       let name := md.constNames[j]!
-
-      -- Skip auto-generated sub-declarations (merged into parent)
-      if name.isInternalDetail then
-        if (declRangeExt.find? env name).isNone then
-          if (findParent name projectNames).isSome then continue
+      if emittedNames.contains name then continue
+      emittedNames := emittedNames.insert name
 
       let some cinfo := env.find? name | continue
 
@@ -188,12 +140,7 @@ unsafe def main : List String → IO Unit := fun args => do
         | some v => v
         | none => false
 
-      -- contains_sorry includes own sorry + merged children's sorry
-      let ownSorry := containsSorryAx cinfo
-      let childSorry := match mergedMap.find? name with
-        | some md => md.childHasSorry
-        | none => false
-      let containsSorry := ownSorry || childSorry
+      let containsSorry := containsSorryAx cinfo
 
       let some kind := getKind cinfo | continue
 

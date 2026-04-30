@@ -7,7 +7,14 @@ import json
 import sys
 from pathlib import Path
 
-from ..common import detect_root_module, find_decl, log, module_short
+from ..common import (
+    add_export_timeout_arg,
+    detect_root_module,
+    export_timeout_from_args,
+    find_decl,
+    log,
+    module_short,
+)
 from ..export import (
     EXPORT_DECLS_LEAN,
     export_cached,
@@ -25,13 +32,24 @@ from .tracker import (
 )
 
 
-def _load_index(args, lake_root: Path, root_module: str):
+def _load_index(
+    args,
+    lake_root: Path,
+    root_module: str,
+    parser: argparse.ArgumentParser,
+):
     if args.load:
         log(f"Loading from {args.load}...")
         data = load_from_file(Path(args.load))
     else:
         cache_path = lake_root / ".lake" / "decls_cache.json"
-        data = export_cached(lake_root, root_module, cache_path, EXPORT_DECLS_LEAN)
+        data = export_cached(
+            lake_root,
+            root_module,
+            cache_path,
+            EXPORT_DECLS_LEAN,
+            timeout=export_timeout_from_args(args, parser),
+        )
 
     recompute_transitive_sorry(data)
 
@@ -194,6 +212,7 @@ def _add_shared_args(parser: argparse.ArgumentParser) -> None:
         "--json", action="store_true",
         help="Output result as JSON",
     )
+    add_export_timeout_arg(parser)
 
 
 def downstream_main() -> None:
@@ -222,7 +241,7 @@ def downstream_main() -> None:
         log("ERROR: Could not detect root module. Use --module.")
         sys.exit(1)
 
-    index = _load_index(args, lake_root, root_module)
+    index = _load_index(args, lake_root, root_module, parser)
     target = _resolve_one(index, args.target)
     max_depth = 1 if args.direct else args.max_depth
     result = analyze_downstream(
@@ -263,7 +282,7 @@ def upstream_main() -> None:
         log("ERROR: Could not detect root module. Use --module.")
         sys.exit(1)
 
-    index = _load_index(args, lake_root, root_module)
+    index = _load_index(args, lake_root, root_module, parser)
     target = _resolve_one(index, args.target)
     max_depth = 1 if args.direct else args.max_depth
     result = analyze_upstream(
@@ -294,7 +313,7 @@ def connected_main() -> None:
         log("ERROR: Could not detect root module. Use --module.")
         sys.exit(1)
 
-    index = _load_index(args, lake_root, root_module)
+    index = _load_index(args, lake_root, root_module, parser)
     left = _resolve_one(index, args.left)
     right = _resolve_one(index, args.right)
     result = dependency_relation(index, left, right, max_depth=args.max_depth)

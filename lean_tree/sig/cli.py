@@ -6,7 +6,14 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from ..common import detect_root_module, find_by_module, find_decl, log
+from ..common import (
+    add_export_timeout_arg,
+    detect_root_module,
+    export_timeout_from_args,
+    find_by_module,
+    find_decl,
+    log,
+)
 from ..export import EXPORT_SIGS_LEAN, export_cached, load_from_file
 from .tracker import build_index, dep_closure
 from .render import render_context
@@ -36,6 +43,7 @@ def main(argv: Optional[list[str]] = None) -> None:
                         help="Output raw JSON instead of rendered context")
     parser.add_argument("--no-context", action="store_true",
                         help="Show only target declarations, skip dependencies")
+    add_export_timeout_arg(parser)
 
     args = parser.parse_args(argv)
 
@@ -54,7 +62,8 @@ def main(argv: Optional[list[str]] = None) -> None:
 
         cache_path = lake_root / ".lake" / "sigs_cache.json"
         data = export_cached(lake_root, root_module, cache_path,
-                             EXPORT_SIGS_LEAN, timeout=180)
+                             EXPORT_SIGS_LEAN,
+                             timeout=export_timeout_from_args(args, parser))
 
     if args.save:
         Path(args.save).write_text(json.dumps(data, indent=2) + "\n")

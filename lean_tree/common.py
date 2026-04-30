@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import re
 import sys
 from pathlib import Path
@@ -11,6 +12,33 @@ from typing import Optional
 def log(msg: str) -> None:
     """Print status message to stderr."""
     print(msg, file=sys.stderr)
+
+
+def add_export_timeout_arg(parser: argparse.ArgumentParser) -> None:
+    """Add the shared Lean export timeout option to a CLI parser."""
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "Timeout for the Lean export subprocess in seconds. "
+            "Defaults to no timeout; use 0 to disable explicitly."
+        ),
+    )
+
+
+def export_timeout_from_args(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+) -> Optional[float]:
+    """Normalize the shared timeout argument for subprocess.run."""
+    timeout = args.timeout
+    if timeout is None or timeout == 0:
+        return None
+    if timeout < 0:
+        parser.error("--timeout must be non-negative")
+    return timeout
 
 
 def detect_root_module(lake_root: Path) -> str:

@@ -1,7 +1,7 @@
 """Run Lean exporters and load declaration databases.
 
-Supports incremental caching: only re-runs the Lean export when oleans
-have changed since the last export.
+Supports incremental caching: re-runs the Lean export when project oleans,
+exporter scripts, or cached module membership have changed.
 """
 
 import json
@@ -19,7 +19,7 @@ def run_lean_export(
     lake_root: Path,
     root_module: str,
     export_lean: Path,
-    timeout: int = 120,
+    timeout: Optional[float] = None,
 ) -> dict:
     """Run a Lean exporter script and return the parsed JSON.
 
@@ -98,9 +98,11 @@ def export_cached(
     root_module: str,
     cache_path: Path,
     export_lean: Path,
-    timeout: int = 120,
+    timeout: Optional[float] = None,
 ) -> dict:
-    """Export declarations with caching. Re-exports only when oleans changed.
+    """Export declarations with caching.
+
+    Re-exports when project oleans or the exporter script changed.
 
     Returns the declaration data dict.
     """
@@ -109,8 +111,13 @@ def export_cached(
     if cache_path.exists():
         cache_mtime = cache_path.stat().st_mtime
         latest_olean = _latest_olean_mtime(lake_root, root_module)
+        exporter_mtime = export_lean.stat().st_mtime
 
-        if latest_olean > 0 and latest_olean <= cache_mtime:
+        if (
+            latest_olean > 0
+            and latest_olean <= cache_mtime
+            and exporter_mtime <= cache_mtime
+        ):
             try:
                 cached_data = load_from_file(cache_path)
                 cached_modules = {d["module"] for d in cached_data["declarations"]}
@@ -123,6 +130,8 @@ def export_cached(
                     print("Detected deleted modules, re-exporting...", file=sys.stderr)
             except (json.JSONDecodeError, KeyError, OSError):
                 pass  # Corrupt cache, re-export
+        elif exporter_mtime > cache_mtime:
+            print("Exporter changed, re-exporting...", file=sys.stderr)
 
     if needs_export:
         print(f"Oleans changed, re-exporting from {root_module}...",
