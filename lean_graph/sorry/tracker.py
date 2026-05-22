@@ -1,4 +1,4 @@
-"""Core goal tracking: BFS, sorry detection, tree rendering."""
+"""Core goal tracking: BFS, sorry detection, graph rendering."""
 
 from __future__ import annotations
 
@@ -103,7 +103,7 @@ def module_to_path(module: str, lake_root: Optional[str] = None) -> str:
 
 @dataclass
 class SorryLeaf:
-    """A declaration with explicit sorry in the dependency tree."""
+    """A declaration with explicit sorry in the dependency graph."""
     name: str
     module: str
     file: str = ""
@@ -117,12 +117,12 @@ class TrackerResult:
     target: str
     sorry_leaves: list[SorryLeaf]
     total_deps: int
-    tree: str = ""
+    graph: str = ""
     axioms: list[str] = field(default_factory=list)
 
 
 def analyze_target(index: dict[str, DeclInfo], target: str,
-                   show_tree: bool = True,
+                   show_graph: bool = True,
                    lake_root: Optional[str] = None) -> TrackerResult:
     """Analyze a target declaration and return its sorry dependency info."""
     graph = DeclarationGraph(index)
@@ -148,27 +148,27 @@ def analyze_target(index: dict[str, DeclInfo], target: str,
                 line=d.line, is_private=d.is_private,
             ))
 
-    tree = ""
-    if show_tree and (sorry_leaves or axioms):
-        tree = render_tree(target, closure_index, memo, graph=closure_graph)
+    rendered = ""
+    if show_graph and (sorry_leaves or axioms):
+        rendered = render_graph(target, closure_index, memo, graph=closure_graph)
 
     return TrackerResult(
         target=target,
         sorry_leaves=sorry_leaves,
         total_deps=len(closure),
-        tree=tree,
+        graph=rendered,
         axioms=axioms,
     )
 
 
 def analyze_scope(index: dict[str, DeclInfo], decls: list[DeclInfo],
-                  show_tree: bool = True,
+                  show_graph: bool = True,
                   lake_root: Optional[str] = None) -> TrackerResult:
-    """Analyze a scope (file/module/project) -- union of sorry trees.
+    """Analyze a scope (file/module/project) -- union of sorry graphs.
 
     Treats the scope as a virtual root: collects all sorry leaves reachable
-    from any declaration in the scope, deduplicates, and renders a combined tree
-    with shared visited set (so subtrees aren't repeated).
+    from any declaration in the scope, deduplicates, and renders a combined
+    graph with shared visited set (so subtrees aren't repeated).
     """
     all_sorry_leaves: dict[str, SorryLeaf] = {}
     all_axioms: set[str] = set()
@@ -194,8 +194,8 @@ def analyze_scope(index: dict[str, DeclInfo], decls: list[DeclInfo],
 
     sorry_leaves = list(all_sorry_leaves.values())
 
-    tree = ""
-    if show_tree and sorry_decl_names and (sorry_leaves or all_axioms):
+    rendered = ""
+    if show_graph and sorry_decl_names and (sorry_leaves or all_axioms):
         # Build combined closure + memo for rendering
         combined_index: dict[str, DeclInfo] = {}
         for name in sorry_decl_names:
@@ -206,7 +206,7 @@ def analyze_scope(index: dict[str, DeclInfo], decls: list[DeclInfo],
         for d2 in combined_index.values():
             has_transitive_sorry(d2.name, combined_index, memo, graph=combined_graph)
 
-        tree = render_scope_tree(
+        rendered = render_scope_graph(
             sorry_decl_names,
             combined_index,
             memo,
@@ -217,13 +217,13 @@ def analyze_scope(index: dict[str, DeclInfo], decls: list[DeclInfo],
         target=f"[{len(decls)} declarations]",
         sorry_leaves=sorry_leaves,
         total_deps=len(all_closure_names),
-        tree=tree,
+        graph=rendered,
         axioms=sorted(all_axioms),
     )
 
 
 # ---------------------------------------------------------------------------
-# Tree rendering
+# Graph rendering
 # ---------------------------------------------------------------------------
 
 def display_name(decl: DeclInfo) -> str:
@@ -235,16 +235,16 @@ def display_name(decl: DeclInfo) -> str:
     return decl.name
 
 
-def _render_tree(roots: list[str], index: dict[str, DeclInfo],
-                 memo: dict[str, bool],
-                 graph: DeclarationGraph | None = None) -> str:
-    """Render ASCII dependency tree showing sorry branches."""
+def _render_graph(roots: list[str], index: dict[str, DeclInfo],
+                  memo: dict[str, bool],
+                  graph: DeclarationGraph | None = None) -> str:
+    """Render ASCII dependency graph showing sorry branches."""
     lines: list[str] = []
     visited: set[str] = set()
     graph = graph or DeclarationGraph(index)
 
     def _walk(name: str, prefix: str, is_last: bool) -> None:
-        connector = "\u2514\u2500 " if is_last else "\u251c\u2500 "
+        connector = "└─ " if is_last else "├─ "
 
         if name in visited:
             label = display_name(index[name]) if name in index else name
@@ -272,7 +272,7 @@ def _render_tree(roots: list[str], index: dict[str, DeclInfo],
         if not issue_deps:
             return
 
-        extension = "   " if is_last else "\u2502  "
+        extension = "   " if is_last else "│  "
         new_prefix = prefix + extension
         for i, dep in enumerate(issue_deps):
             _walk(dep, new_prefix, i == len(issue_deps) - 1)
@@ -283,15 +283,15 @@ def _render_tree(roots: list[str], index: dict[str, DeclInfo],
     return "\n".join(lines)
 
 
-def render_tree(target: str, index: dict[str, DeclInfo],
-                memo: dict[str, bool],
-                graph: DeclarationGraph | None = None) -> str:
-    """Render an ASCII dependency tree showing sorry branches."""
-    return _render_tree([target], index, memo, graph=graph)
+def render_graph(target: str, index: dict[str, DeclInfo],
+                 memo: dict[str, bool],
+                 graph: DeclarationGraph | None = None) -> str:
+    """Render an ASCII dependency graph showing sorry branches."""
+    return _render_graph([target], index, memo, graph=graph)
 
 
-def render_scope_tree(roots: list[str], index: dict[str, DeclInfo],
-                      memo: dict[str, bool],
-                      graph: DeclarationGraph | None = None) -> str:
-    """Render combined sorry tree for multiple roots, sharing visited set."""
-    return _render_tree(roots, index, memo, graph=graph)
+def render_scope_graph(roots: list[str], index: dict[str, DeclInfo],
+                       memo: dict[str, bool],
+                       graph: DeclarationGraph | None = None) -> str:
+    """Render combined sorry graph for multiple roots, sharing visited set."""
+    return _render_graph(roots, index, memo, graph=graph)

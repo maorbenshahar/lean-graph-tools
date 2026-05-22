@@ -3,6 +3,6 @@ revision = 3
 requires-python = ">=3.10"
 
 [[package]]
-name = "lean-tree-tools"
-version = "0.3.0"
+name = "lean-graph-tools"
+version = "0.4.0"
 source = { editable = "." }

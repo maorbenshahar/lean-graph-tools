@@ -1,7 +1,7 @@
 """Tests for sig render module."""
 
-from lean_tree.sig.tracker import build_index, dep_closure, DeclInfo, FieldInfo, CtorInfo
-from lean_tree.sig.render import render_decl, render_context
+from lean_graph.sig.tracker import build_index, dep_closure, DeclInfo, FieldInfo, CtorInfo
+from lean_graph.sig.render import render_decl, render_context
 
 
 def test_render_theorem():

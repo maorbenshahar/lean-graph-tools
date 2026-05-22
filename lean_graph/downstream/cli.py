@@ -1,4 +1,4 @@
-"""CLI entry point for downstream-tree."""
+"""CLI entry point for downstream-graph."""
 
 from __future__ import annotations
 
@@ -100,8 +100,8 @@ def _print_downstream_result(
         print(f"    {lake_root / (decl.module.replace('.', '/') + '.lean')}{loc}"
               if decl.module else f"    {mod}{loc}")
 
-    if result.tree:
-        print(f"\n{result.tree}")
+    if result.graph:
+        print(f"\n{result.graph}")
 
 
 def _print_upstream_result(
@@ -129,8 +129,8 @@ def _print_upstream_result(
         print(f"    {lake_root / (decl.module.replace('.', '/') + '.lean')}{loc}"
               if decl.module else f"    {mod}{loc}")
 
-    if result.tree:
-        print(f"\n{result.tree}")
+    if result.graph:
+        print(f"\n{result.graph}")
 
 
 def _print_downstream_json(result: DownstreamResult, lake_root: Path) -> None:
@@ -141,7 +141,7 @@ def _print_downstream_json(result: DownstreamResult, lake_root: Path) -> None:
             downstream_node_to_json(node, str(lake_root))
             for node in result.declarations
         ],
-        "tree": result.tree,
+        "graph": result.graph,
     }, indent=2))
 
 
@@ -153,7 +153,7 @@ def _print_upstream_json(result: UpstreamResult, lake_root: Path) -> None:
             downstream_node_to_json(node, str(lake_root))
             for node in result.declarations
         ],
-        "tree": result.tree,
+        "graph": result.graph,
     }, indent=2))
 
 
@@ -217,7 +217,7 @@ def _add_shared_args(parser: argparse.ArgumentParser) -> None:
 
 def downstream_main() -> None:
     parser = argparse.ArgumentParser(
-        prog="downstream-tree",
+        prog="downstream-graph",
         description="Reverse dependency tracker for Lean 4 project declarations",
     )
     parser.add_argument(
@@ -229,8 +229,8 @@ def downstream_main() -> None:
         help="Only show direct downstream users",
     )
     parser.add_argument(
-        "--no-tree", action="store_true",
-        help="Skip dependency tree rendering",
+        "--no-graph", action="store_true",
+        help="Skip dependency graph rendering",
     )
     _add_shared_args(parser)
     args = parser.parse_args()
@@ -247,7 +247,7 @@ def downstream_main() -> None:
     result = analyze_downstream(
         index,
         target,
-        show_tree=not args.no_tree,
+        show_graph=not args.no_graph,
         max_depth=max_depth,
     )
     if args.json:
@@ -258,7 +258,7 @@ def downstream_main() -> None:
 
 def upstream_main() -> None:
     parser = argparse.ArgumentParser(
-        prog="upstream-tree",
+        prog="upstream-graph",
         description="Dependency tracker for Lean 4 project declarations",
     )
     parser.add_argument(
@@ -270,8 +270,8 @@ def upstream_main() -> None:
         help="Only show direct upstream dependencies",
     )
     parser.add_argument(
-        "--no-tree", action="store_true",
-        help="Skip dependency tree rendering",
+        "--no-graph", action="store_true",
+        help="Skip dependency graph rendering",
     )
     _add_shared_args(parser)
     args = parser.parse_args()
@@ -288,7 +288,7 @@ def upstream_main() -> None:
     result = analyze_upstream(
         index,
         target,
-        show_tree=not args.no_tree,
+        show_graph=not args.no_graph,
         max_depth=max_depth,
     )
     if args.json:

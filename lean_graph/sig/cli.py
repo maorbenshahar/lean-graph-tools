@@ -1,4 +1,4 @@
-"""CLI entry point for sig-tree."""
+"""CLI entry point for sig-graph."""
 
 import argparse
 import json
@@ -21,7 +21,7 @@ from .render import render_context
 
 def main(argv: Optional[list[str]] = None) -> None:
     parser = argparse.ArgumentParser(
-        prog="sig-tree",
+        prog="sig-graph",
         description="Extract type signature context for Lean 4 auditors.",
     )
 

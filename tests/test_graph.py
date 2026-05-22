@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 
-from lean_tree.graph import DeclarationGraph
+from lean_graph.graph import DeclarationGraph
 
 
 @dataclass

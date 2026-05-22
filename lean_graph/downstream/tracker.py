@@ -25,7 +25,7 @@ class DownstreamResult:
     target: str
     declarations: list[DownstreamNode]
     total_downstream: int
-    tree: str = ""
+    graph: str = ""
 
 
 @dataclass
@@ -35,7 +35,7 @@ class UpstreamResult:
     target: str
     declarations: list[DownstreamNode]
     total_upstream: int
-    tree: str = ""
+    graph: str = ""
 
 
 @dataclass
@@ -90,48 +90,48 @@ def upstream_closure(
 def analyze_downstream(
     index: dict[str, DeclInfo],
     target: str,
-    show_tree: bool = True,
+    show_graph: bool = True,
     max_depth: Optional[int] = None,
 ) -> DownstreamResult:
     """Analyze all downstream declarations of target."""
     graph = DeclarationGraph(index)
     nodes = downstream_closure(index, target, max_depth=max_depth, graph=graph)
-    tree = (
-        render_downstream_tree(index, target, max_depth=max_depth, graph=graph)
-        if show_tree else ""
+    rendered = (
+        render_downstream_graph(index, target, max_depth=max_depth, graph=graph)
+        if show_graph else ""
     )
     return DownstreamResult(
         target=target,
         declarations=nodes,
         total_downstream=len(nodes),
-        tree=tree,
+        graph=rendered,
     )
 
 
 def analyze_upstream(
     index: dict[str, DeclInfo],
     target: str,
-    show_tree: bool = True,
+    show_graph: bool = True,
     max_depth: Optional[int] = None,
 ) -> UpstreamResult:
     """Analyze all upstream dependencies of target."""
     graph = DeclarationGraph(index)
     nodes = upstream_closure(index, target, max_depth=max_depth, graph=graph)
-    tree = (
-        render_dependency_tree(
+    rendered = (
+        render_dependency_graph(
             index,
             target,
             "dependencies",
             max_depth=max_depth,
             graph=graph,
         )
-        if show_tree else ""
+        if show_graph else ""
     )
     return UpstreamResult(
         target=target,
         declarations=nodes,
         total_upstream=len(nodes),
-        tree=tree,
+        graph=rendered,
     )
 
 
@@ -178,14 +178,14 @@ def display_name(decl: DeclInfo) -> str:
     return decl.name
 
 
-def render_downstream_tree(
+def render_downstream_graph(
     index: dict[str, DeclInfo],
     target: str,
     max_depth: Optional[int] = None,
     graph: DeclarationGraph | None = None,
 ) -> str:
-    """Render a reverse dependency tree rooted at target."""
-    return render_dependency_tree(
+    """Render a reverse dependency graph rooted at target."""
+    return render_dependency_graph(
         index,
         target,
         "dependents",
@@ -194,14 +194,14 @@ def render_downstream_tree(
     )
 
 
-def render_dependency_tree(
+def render_dependency_graph(
     index: dict[str, DeclInfo],
     target: str,
     direction: Direction,
     max_depth: Optional[int] = None,
     graph: DeclarationGraph | None = None,
 ) -> str:
-    """Render a dependency tree rooted at target in either graph direction."""
+    """Render a dependency graph rooted at target in either edge direction."""
     graph = graph or DeclarationGraph(index)
     lines: list[str] = []
     visited: set[str] = set()

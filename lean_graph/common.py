@@ -1,4 +1,4 @@
-"""Shared utilities for sorry-tree and sig-tree."""
+"""Shared utilities for sorry-graph and sig-graph."""
 
 from __future__ import annotations
 

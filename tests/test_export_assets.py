@@ -1,4 +1,4 @@
-from lean_tree.export import EXPORT_DECLS_LEAN, EXPORT_SIGS_LEAN
+from lean_graph.export import EXPORT_DECLS_LEAN, EXPORT_SIGS_LEAN
 
 
 def test_export_assets_exist() -> None:

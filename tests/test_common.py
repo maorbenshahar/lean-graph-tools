@@ -4,7 +4,7 @@ import argparse
 
 import pytest
 
-from lean_tree.common import add_export_timeout_arg, export_timeout_from_args
+from lean_graph.common import add_export_timeout_arg, export_timeout_from_args
 
 
 def _parser() -> argparse.ArgumentParser:

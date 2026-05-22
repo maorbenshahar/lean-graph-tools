@@ -11,7 +11,7 @@ Fix: pass `loadExts := true` to `importModules`.
 
 Run with:
   cd /home/maor/Desktop/git/QuantumInformation/.claude/worktrees/agent-a6ae8225/QuantumInformation
-  lake env lean --run /home/maor/Desktop/git/sig-tree/lean/TestPP.lean
+  lake env lean --run /home/maor/Desktop/git/lean-graph-tools/lean_graph/lean/TestPP.lean
 -/
 import Lean
 open Lean Meta

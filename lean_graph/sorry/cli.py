@@ -1,4 +1,4 @@
-"""CLI entry point for sorry-tree."""
+"""CLI entry point for sorry-graph."""
 
 import argparse
 import json
@@ -55,8 +55,8 @@ def _print_result(result: TrackerResult, root_module: str = "") -> None:
             else:
                 print(f"    {mod}{loc}")
 
-    if result.tree:
-        print(f"\n{result.tree}")
+    if result.graph:
+        print(f"\n{result.graph}")
 
 
 def _print_json(result: TrackerResult) -> None:
@@ -70,7 +70,7 @@ def _print_json(result: TrackerResult) -> None:
         ],
         "total_deps": result.total_deps,
         "axioms": result.axioms,
-        "tree": result.tree,
+        "graph": result.graph,
     }, indent=2))
 
 
@@ -102,7 +102,7 @@ def _load_index(args, lake_root, root_module, parser):
 
 def main():
     parser = argparse.ArgumentParser(
-        prog="sorry-tree",
+        prog="sorry-graph",
         description="Sorry dependency tracker for Lean 4 projects",
     )
     parser.add_argument(
@@ -111,7 +111,7 @@ def main():
     )
     parser.add_argument(
         "--file", "-f",
-        help="Sorry tree for a file/module (e.g., InfoTheory/Measurement/POVM)",
+        help="Sorry graph for a file/module (e.g., InfoTheory/Measurement/POVM)",
     )
     parser.add_argument(
         "--all", "-a", action="store_true",
@@ -134,8 +134,8 @@ def main():
         help="Save exported JSON to file (for reuse with --load)",
     )
     parser.add_argument(
-        "--no-tree", action="store_true",
-        help="Skip dependency tree rendering",
+        "--no-graph", action="store_true",
+        help="Skip dependency graph rendering",
     )
     parser.add_argument(
         "--json", action="store_true",
@@ -147,9 +147,9 @@ def main():
     if not args.target and not args.file and not args.all:
         parser.print_help()
         print("\nExamples:")
-        print("  sorry-tree holevo_bound")
-        print("  sorry-tree -f InfoTheory/Measurement/POVM")
-        print("  sorry-tree --all")
+        print("  sorry-graph holevo_bound")
+        print("  sorry-graph -f InfoTheory/Measurement/POVM")
+        print("  sorry-graph --all")
         sys.exit(1)
 
     lake_root = Path(args.project).resolve()
@@ -177,7 +177,7 @@ def main():
         if not sorry:
             return
 
-        result = analyze_scope(index, decls, show_tree=not args.no_tree,
+        result = analyze_scope(index, decls, show_graph=not args.no_graph,
                                lake_root=str(lake_root))
         if args.json:
             _print_json(result)
@@ -200,7 +200,7 @@ def main():
             print("All proven!")
             return
 
-        result = analyze_scope(index, all_decls, show_tree=not args.no_tree,
+        result = analyze_scope(index, all_decls, show_graph=not args.no_graph,
                                lake_root=str(lake_root))
         if args.json:
             _print_json(result)
@@ -215,7 +215,7 @@ def main():
         sys.exit(1)
 
     for decl in matches:
-        result = analyze_target(index, decl.name, show_tree=not args.no_tree,
+        result = analyze_target(index, decl.name, show_graph=not args.no_graph,
                                 lake_root=str(lake_root))
         if args.json:
             _print_json(result)

@@ -3,24 +3,24 @@ requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "lean-tree-tools"
-version = "0.3.0"
+name = "lean-graph-tools"
+version = "0.4.0"
 description = "Sorry dependency tracker and type signature extractor for Lean 4 projects"
 requires-python = ">=3.10"
 license = "MIT"
 
 [project.scripts]
-sorry-tree = "lean_tree.sorry.cli:main"
-sig-tree = "lean_tree.sig.cli:main"
-downstream-tree = "lean_tree.downstream.cli:downstream_main"
-upstream-tree = "lean_tree.downstream.cli:upstream_main"
-dep-connected = "lean_tree.downstream.cli:connected_main"
+sorry-graph = "lean_graph.sorry.cli:main"
+sig-graph = "lean_graph.sig.cli:main"
+downstream-graph = "lean_graph.downstream.cli:downstream_main"
+upstream-graph = "lean_graph.downstream.cli:upstream_main"
+dep-connected = "lean_graph.downstream.cli:connected_main"
 
 [tool.setuptools.packages.find]
-include = ["lean_tree*"]
+include = ["lean_graph*"]
 
 [tool.setuptools.package-data]
-lean_tree = ["lean/*.lean"]
+lean_graph = ["lean/*.lean"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

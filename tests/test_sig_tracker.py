@@ -1,7 +1,7 @@
 """Tests for sig tracker module."""
 
-from lean_tree.sig.tracker import build_index, dep_closure
-from lean_tree.common import find_decl, find_by_module
+from lean_graph.sig.tracker import build_index, dep_closure
+from lean_graph.common import find_decl, find_by_module
 
 
 SAMPLE_DATA = {

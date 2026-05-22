@@ -1,6 +1,6 @@
 """Tests for sorry dependency tracking over the shared graph core."""
 
-from lean_tree.sorry.tracker import (
+from lean_graph.sorry.tracker import (
     analyze_scope,
     analyze_target,
     build_index,
@@ -103,14 +103,14 @@ def test_has_transitive_sorry():
     assert has_transitive_sorry("TestLib.assumed", index)
 
 
-def test_analyze_target_finds_sorry_leaf_and_tree():
+def test_analyze_target_finds_sorry_leaf_and_graph():
     index = build_index(SAMPLE_DATA)
-    result = analyze_target(index, "TestLib.top", show_tree=True, lake_root="/tmp")
+    result = analyze_target(index, "TestLib.top", show_graph=True, lake_root="/tmp")
     assert result.total_deps == 4
     assert [leaf.name for leaf in result.sorry_leaves] == ["TestLib.sorryLeaf"]
     assert result.sorry_leaves[0].file == "/tmp/TestLib/Basic.lean"
-    assert "TestLib.mid" in result.tree
-    assert "TestLib.sorryLeaf [sorry]" in result.tree
+    assert "TestLib.mid" in result.graph
+    assert "TestLib.sorryLeaf [sorry]" in result.graph
 
 
 def test_analyze_scope_deduplicates_shared_sorry_leaf():

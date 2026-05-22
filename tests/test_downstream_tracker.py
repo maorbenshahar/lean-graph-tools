@@ -1,6 +1,6 @@
 """Tests for downstream dependency tracking."""
 
-from lean_tree.downstream.tracker import (
+from lean_graph.downstream.tracker import (
     analyze_downstream,
     analyze_upstream,
     build_index,
@@ -8,8 +8,8 @@ from lean_tree.downstream.tracker import (
     dependency_relation,
     downstream_closure,
     find_dependency_path,
-    render_dependency_tree,
-    render_downstream_tree,
+    render_dependency_graph,
+    render_downstream_graph,
     upstream_closure,
 )
 
@@ -154,30 +154,30 @@ def test_downstream_direct_limit():
     }
 
 
-def test_analyze_downstream_renders_tree():
+def test_analyze_downstream_renders_graph():
     index = build_index(SAMPLE_DATA)
-    result = analyze_downstream(index, "TestLib.BaseType", show_tree=True)
+    result = analyze_downstream(index, "TestLib.BaseType", show_graph=True)
     assert result.total_downstream == 5
-    assert "TestLib.BaseType" in result.tree
-    assert "TestLib.topTheorem" in result.tree
-    assert "contains sorry" in result.tree
+    assert "TestLib.BaseType" in result.graph
+    assert "TestLib.topTheorem" in result.graph
+    assert "contains sorry" in result.graph
 
 
-def test_analyze_upstream_renders_tree():
+def test_analyze_upstream_renders_graph():
     index = build_index(SAMPLE_DATA)
-    result = analyze_upstream(index, "TestLib.topTheorem", show_tree=True)
+    result = analyze_upstream(index, "TestLib.topTheorem", show_graph=True)
     assert result.total_upstream == 4
-    assert "TestLib.topTheorem" in result.tree
-    assert "TestLib.BaseType" in result.tree
+    assert "TestLib.topTheorem" in result.graph
+    assert "TestLib.BaseType" in result.graph
 
 
-def test_render_downstream_tree_shared_node():
+def test_render_downstream_graph_shared_node():
     index = build_index(SAMPLE_DATA)
-    tree = render_downstream_tree(index, "TestLib.BaseType")
-    assert "TestLib.baseLemma (see above)" in tree
+    rendered = render_downstream_graph(index, "TestLib.BaseType")
+    assert "TestLib.baseLemma (see above)" in rendered
 
 
-def test_render_upstream_tree_diamond_does_not_duplicate_subtree():
+def test_render_upstream_graph_diamond_does_not_duplicate_subgraph():
     data = {
         "declarations": [
             {
@@ -204,12 +204,12 @@ def test_render_upstream_tree_diamond_does_not_duplicate_subtree():
     }
     index = build_index(data)
 
-    tree = render_dependency_tree(index, "A", "dependencies")
-    assert tree.count("D [def]") == 1
-    assert "D (see above)" in tree
+    rendered = render_dependency_graph(index, "A", "dependencies")
+    assert rendered.count("D [def]") == 1
+    assert "D (see above)" in rendered
 
 
-def test_render_downstream_tree_diamond_does_not_duplicate_subtree():
+def test_render_downstream_graph_diamond_does_not_duplicate_subgraph():
     data = {
         "declarations": [
             {
@@ -236,12 +236,12 @@ def test_render_downstream_tree_diamond_does_not_duplicate_subtree():
     }
     index = build_index(data)
 
-    tree = render_dependency_tree(index, "D", "dependents")
-    assert tree.count("A [def]") == 1
-    assert "A (see above)" in tree
+    rendered = render_dependency_graph(index, "D", "dependents")
+    assert rendered.count("A [def]") == 1
+    assert "A (see above)" in rendered
 
 
-def test_render_tree_cycle_terminates_with_see_above():
+def test_render_graph_cycle_terminates_with_see_above():
     data = {
         "declarations": [
             {
@@ -258,9 +258,9 @@ def test_render_tree_cycle_terminates_with_see_above():
     }
     index = build_index(data)
 
-    tree = render_dependency_tree(index, "A", "dependencies")
-    assert tree.count("A [def]") == 1
-    assert "A (see above)" in tree
+    rendered = render_dependency_graph(index, "A", "dependencies")
+    assert rendered.count("A [def]") == 1
+    assert "A (see above)" in rendered
 
 
 def test_find_dependency_path():
