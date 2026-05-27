@@ -87,6 +87,7 @@ def _load_index(args, lake_root, root_module, parser):
             cache_path,
             EXPORT_DECLS_LEAN,
             timeout=export_timeout_from_args(args, parser),
+            force_full=args.rebuild_cache,
         )
 
     recompute_transitive_sorry(data)
@@ -132,6 +133,10 @@ def main():
     parser.add_argument(
         "--save", "-s",
         help="Save exported JSON to file (for reuse with --load)",
+    )
+    parser.add_argument(
+        "--rebuild-cache", action="store_true",
+        help="Force a full re-export instead of the incremental partial rebuild",
     )
     parser.add_argument(
         "--no-graph", action="store_true",

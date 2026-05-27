@@ -49,6 +49,7 @@ def _load_index(
             cache_path,
             EXPORT_DECLS_LEAN,
             timeout=export_timeout_from_args(args, parser),
+            force_full=args.rebuild_cache,
         )
 
     recompute_transitive_sorry(data)
@@ -203,6 +204,10 @@ def _add_shared_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--save", "-s",
         help="Save exported JSON to file (for reuse with --load)",
+    )
+    parser.add_argument(
+        "--rebuild-cache", action="store_true",
+        help="Force a full re-export instead of the incremental partial rebuild",
     )
     parser.add_argument(
         "--max-depth", type=int,

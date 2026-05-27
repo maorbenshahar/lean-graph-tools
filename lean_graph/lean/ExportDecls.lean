@@ -76,15 +76,24 @@ partial def hasSorryTransitive (env : Environment) (projectNames : NameHashSet)
       return true
   return false
 
+/-- Module filter parsed from CLI args after the root module.
+    No args after root → emit every project-local module (`none`).
+    Args present → emit only declarations from those modules. -/
+def parseModuleFilter (args : List String) : Option NameHashSet :=
+  if args.isEmpty then none
+  else some (args.foldl (init := ({} : NameHashSet)) fun s m => s.insert m.toName)
+
 unsafe def main : List String → IO Unit := fun args => do
   let rootModuleStr ← match args.head? with
     | some m => pure m
     | none =>
-      IO.eprintln "Usage: lake env lean --run ExportDecls.lean <RootModule>"
+      IO.eprintln "Usage: lake env lean --run ExportDecls.lean <RootModule> [<Mod1> <Mod2> ...]"
       IO.eprintln "Example: lake env lean --run ExportDecls.lean QuantumInformation"
+      IO.eprintln "With filter: lake env lean --run ExportDecls.lean QuantumInformation QuantumInformation.Foo QuantumInformation.Bar"
       IO.Process.exit 1
 
   let rootModule := rootModuleStr.toName
+  let moduleFilter := parseModuleFilter args.tail
 
   enableInitializersExecution
   initSearchPath (← findSysroot)
@@ -93,7 +102,9 @@ unsafe def main : List String → IO Unit := fun args => do
   let mods := env.header.moduleNames
   let rootName := rootModule.getRoot
 
-  -- Collect all project declaration names into a set (including internal/private)
+  -- Collect all project declaration names into a set (including internal/private).
+  -- We collect from ALL project modules even under a filter, because dep tracking
+  -- and sorry transitivity need the full project view.
   let mut projectNames : NameHashSet := {}
   for i in [:mods.size] do
     if mods[i]!.getRoot != rootName then continue
@@ -125,6 +136,9 @@ unsafe def main : List String → IO Unit := fun args => do
 
   for i in [:mods.size] do
     if mods[i]!.getRoot != rootName then continue
+    -- Apply module filter (if any) to the EMISSION loop only.
+    if let some filter := moduleFilter then
+      if !filter.contains mods[i]! then continue
     let md := env.header.moduleData[i]!
     let modStr := mods[i]!.toString
 
@@ -167,10 +181,20 @@ unsafe def main : List String → IO Unit := fun args => do
 
       decls := decls.push <| Json.mkObj fields.toList
 
+  -- Canonical project module set: every module reachable from the root via
+  -- `importModules`. Lake doesn't always delete oleans for removed imports,
+  -- so this is the authoritative truth Python uses to garbage-collect stale
+  -- cache entries that survive a disk walk.
+  let mut projectModules : Array Json := #[]
+  for i in [:mods.size] do
+    if mods[i]!.getRoot == rootName then
+      projectModules := projectModules.push (.str mods[i]!.toString)
+
   let output := Json.mkObj [
     ("root_module", .str rootModuleStr),
     ("declaration_count", .num decls.size),
-    ("declarations", .arr decls)
+    ("declarations", .arr decls),
+    ("project_modules", .arr projectModules)
   ]
 
   IO.println output.pretty

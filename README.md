@@ -151,6 +151,7 @@ The CLIs share these options where applicable:
 | `--max-depth` | Limit dependency distance (supported by downstream tools) |
 | `--json` | JSON output |
 | `--timeout` | Lean export timeout in seconds; defaults to no timeout, and `0` disables it explicitly |
+| `--rebuild-cache` | Force a full re-export instead of an incremental cache update |
 
 Caching: exports are stored in `.lake/` and regenerated when project oleans,
 exporter scripts, or cached module membership change.

@@ -43,6 +43,8 @@ def main(argv: Optional[list[str]] = None) -> None:
                         help="Output raw JSON instead of rendered context")
     parser.add_argument("--no-context", action="store_true",
                         help="Show only target declarations, skip dependencies")
+    parser.add_argument("--rebuild-cache", action="store_true",
+                        help="Force a full re-export instead of the incremental partial rebuild")
     add_export_timeout_arg(parser)
 
     args = parser.parse_args(argv)
@@ -63,7 +65,8 @@ def main(argv: Optional[list[str]] = None) -> None:
         cache_path = lake_root / ".lake" / "sigs_cache.json"
         data = export_cached(lake_root, root_module, cache_path,
                              EXPORT_SIGS_LEAN,
-                             timeout=export_timeout_from_args(args, parser))
+                             timeout=export_timeout_from_args(args, parser),
+                             force_full=args.rebuild_cache)
 
     if args.save:
         Path(args.save).write_text(json.dumps(data, indent=2) + "\n")
