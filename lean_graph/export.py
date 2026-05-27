@@ -11,6 +11,8 @@ Supports incremental caching:
 """
 
 import json
+import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -42,13 +44,35 @@ def run_lean_export(
     cmd = ["lake", "env", "lean", "--run", script, root_module]
     if modules is not None:
         cmd.extend(modules)
-    result = subprocess.run(
+
+    # We Popen + start_new_session so the lake parent and every lean
+    # worker it forks share one process group. On TimeoutExpired,
+    # subprocess.run only SIGKILLs the immediate child (lake); the lean
+    # worker(s) get reparented to PID 1 and keep running with multi-GB
+    # RSS until they finish on their own. killpg the whole group instead.
+    proc = subprocess.Popen(
         cmd,
         cwd=lake_root,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=timeout,
+        start_new_session=True,
     )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        # Reap the parent and drain pipes; ignore further output.
+        try:
+            proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+        raise
+    result = subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
     if result.returncode != 0:
         name = export_lean.stem
         print(f"ERROR: {name} failed (exit {result.returncode})", file=sys.stderr)
