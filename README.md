@@ -45,10 +45,10 @@ MyProject.Theorems.main_theorem: 3 sorry, 131 deps
 
 ### sig-graph
 
-Extracts a self-contained context file of type signatures for auditing. Given target declarations, it follows type-level dependencies (not proofs) and renders everything an auditor needs to understand the types.
+Extracts a self-contained, source-faithful audit digest for a set of target declarations. It follows type-level dependencies (not proofs) and renders the closure exactly as authored, so an auditor can check whether each declaration is *stated* correctly.
 
-1. `ExportSigs.lean` exports pretty-printed type signatures, structure fields, inductive constructors, and type-level dependencies as JSON.
-2. `render.py` produces a pseudo-Lean context file with targets and their recursive dependencies, topologically sorted.
+1. `ExportSigs.lean` exports, per declaration, the verbatim source slice (with the byte ranges of its proof blocks), type-level dependencies, structure field metadata, docstring, and namespace as JSON — no pretty-printing or elaboration of signatures or bodies.
+2. `render.py` assembles the digest from those slices, leaf-first: `print` mode (default) imports the real modules and shows each decl's source beside its `#check`/`#print`; `self_contained` re-declares the closure over `import Mathlib` only.
 
 ```bash
 # Context for a file

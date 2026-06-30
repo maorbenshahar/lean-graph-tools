@@ -16,7 +16,7 @@ from ..common import (
 )
 from ..export import EXPORT_SIGS_LEAN, export_cached, load_from_file
 from .tracker import SigData, build_index, dep_closure
-from .render import comparator_config, render_context, render_digest
+from .render import comparator_config, render_digest
 
 
 def main(argv: Optional[list[str]] = None) -> None:
@@ -77,9 +77,6 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser.add_argument("--permitted-axioms", type=str,
                         default="Classical.choice,Quot.sound,propext",
                         help="Comma-separated permitted axioms for comparator config.json")
-    parser.add_argument("--legacy-render", action="store_true",
-                        help="Use the old pretty-printed pseudo-Lean output instead of the "
-                             "source-faithful digest")
     add_export_timeout_arg(parser)
 
     args = parser.parse_args(argv)
@@ -152,16 +149,12 @@ def main(argv: Optional[list[str]] = None) -> None:
                     "name": d.name,
                     "kind": d.kind,
                     "module": d.module,
-                    "type_signature": d.type_signature,
                     "is_target": d.name in set(target_names),
                     "is_private": d.is_private,
                     "deps": d.deps,
                     **({"line": d.line} if d.line else {}),
-                    **({"fields": [{"name": f.name, "type": f.type}
+                    **({"fields": [{"name": f.name, "proj_name": f.proj_name}
                                    for f in d.fields]} if d.fields else {}),
-                    **({"constructors": [{"name": c.name, "type": c.type}
-                                         for c in d.constructors]} if d.constructors else {}),
-                    **({"value": d.value} if d.value else {}),
                     **({"parents": d.parents} if d.parents else {}),
                     **({"has_sorry": True} if d.has_sorry else {}),
                     **({"source_text": d.source_text} if d.source_text else {}),
@@ -171,18 +164,10 @@ def main(argv: Optional[list[str]] = None) -> None:
             ],
         }
         output = json.dumps(result, indent=2)
-    elif args.legacy_render:
-        output = render_context(
-            targets=targets,
-            context=closure,
-            root_module=root_module,
-            header=header,
-        )
     else:
         if not sig.has_source_text:
             print("ERROR: this export predates the source-slice fields (no source_text). "
-                  "Re-run without --load, or with --rebuild-cache, to regenerate the cache; "
-                  "or pass --legacy-render for the old pretty-printed output.",
+                  "Re-run without --load, or with --rebuild-cache, to regenerate the cache.",
                   file=sys.stderr)
             sys.exit(1)
         mode = ("comparator" if args.comparator
@@ -213,7 +198,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         print(output)
 
     # Comparator: emit the sibling config.json next to the digest.
-    if args.comparator and not args.json and not args.legacy_render:
+    if args.comparator and not args.json:
         if args.config_out:
             config_path = Path(args.config_out)
         elif args.output:

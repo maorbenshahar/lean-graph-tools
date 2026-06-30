@@ -11,33 +11,38 @@ from ..graph import DeclarationGraph
 
 @dataclass
 class FieldInfo:
-    """A structure field."""
+    """A structure field. Only `name`/`proj_name`/`from_parent` are exported now;
+    `type` is retained for backward-compat with older caches (the field type is
+    shown by the structure's `source_text` slice, not a pretty-printed signature)."""
     name: str
-    type: str
+    type: str = ""
     proj_name: str = ""
     from_parent: bool = False
 
 
 @dataclass
 class CtorInfo:
-    """An inductive constructor."""
+    """An inductive constructor (vestigial: constructors are no longer exported —
+    they appear in the structure/inductive's `source_text` slice)."""
     name: str
-    type: str
+    type: str = ""
 
 
 @dataclass
 class DeclInfo:
-    """A declaration with its type signature and metadata."""
+    """A declaration with its source slice and metadata."""
     name: str
     kind: str
     module: str
     is_private: bool
-    type_signature: str
     deps: list[str]
+    # Legacy pretty-printed fields, no longer emitted by the exporter (the digest
+    # renders from `source_text`). Kept optional so older caches still load.
+    type_signature: Optional[str] = None
     line: Optional[int] = None
     fields: Optional[list[FieldInfo]] = None
     constructors: Optional[list[CtorInfo]] = None
-    value: Optional[str] = None  # For abbrevs
+    value: Optional[str] = None  # For abbrevs (legacy)
     parents: Optional[list[str]] = None  # Parent structure names (from extends)
     has_sorry: bool = False
     docstring: Optional[str] = None
@@ -60,7 +65,7 @@ def build_index(data: dict) -> dict[str, DeclInfo]:
         fields = None
         if "fields" in d and d["fields"] is not None:
             fields = [
-                FieldInfo(name=f["name"], type=f["type"],
+                FieldInfo(name=f["name"], type=f.get("type", ""),
                           proj_name=f.get("projName", ""),
                           from_parent=f.get("fromParent", False))
                 for f in d["fields"]
@@ -69,7 +74,7 @@ def build_index(data: dict) -> dict[str, DeclInfo]:
         ctors = None
         if "constructors" in d and d["constructors"] is not None:
             ctors = [
-                CtorInfo(name=c["name"], type=c["type"])
+                CtorInfo(name=c["name"], type=c.get("type", ""))
                 for c in d["constructors"]
             ]
 
@@ -78,7 +83,7 @@ def build_index(data: dict) -> dict[str, DeclInfo]:
             kind=d["kind"],
             module=d["module"],
             is_private=d.get("is_private", False),
-            type_signature=d["type_signature"],
+            type_signature=d.get("type_signature"),
             deps=d.get("deps", []),
             line=d.get("line"),
             fields=fields,
@@ -125,9 +130,10 @@ def dep_closure(index: dict[str, DeclInfo],
                      targets: list[str]) -> list[DeclInfo]:
     """Compute transitive dependency closure via BFS.
 
-    Follows type + prop-erased value deps (proof deps are excluded).
-    Gives the set of declarations needed to understand what every
-    declaration means and computes.
+    Follows type-level deps plus a def's non-proof value deps (referenced
+    theorems are dropped by the exporter, so proof obligations don't pull their
+    proof trees into the closure). Gives the set of declarations needed to
+    understand what every declaration means and computes.
     """
     graph = DeclarationGraph(index)
     return [

@@ -22,7 +22,7 @@ from typing import Iterable, Optional
 EXPORT_DECLS_LEAN = Path(__file__).resolve().parent / "lean" / "ExportDecls.lean"
 EXPORT_SIGS_LEAN = Path(__file__).resolve().parent / "lean" / "ExportSigs.lean"
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # Per-module maps the exporter emits alongside `declarations`, persisted in the
 # cache so every load path carries them. Each is keyed by module name and merges
@@ -43,6 +43,15 @@ SCHEMA_VERSION = 5
 # copies, `⋯` for commented digests) over these ranges. Both fields live inside
 # each declaration dict, which the per-module declaration merge copies wholesale,
 # so the schema bump (which forces a full re-export) is the only change needed.
+#
+# As of schema v6, the exporter NO LONGER emits the elaborated pretty-printed
+# fields (`type_signature`, `value`, `fields[].type`, `constructors`). Those ran a
+# per-node `inferType`/`ppExpr` pass over every declaration and were the source of
+# OOM blowups on heavy projects; the digest renders from `source_text` instead, so
+# they were dead weight. `fields` now carries only `name`/`projName`/`fromParent`
+# (used to filter standalone projection decls). Deps are computed cheaply from the
+# kernel's `getUsedConstants` (referenced theorems dropped). The bump forces a full
+# re-export, evicting any cache that still carries the heavy fields.
 _PERMODULE_TOPLEVEL_MAPS = ("module_imports", "module_opens", "module_notations",
                             "module_variables")
 

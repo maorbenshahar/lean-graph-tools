@@ -1,197 +1,100 @@
-"""Tests for sig render module."""
+"""Tests for the source-faithful audit-digest renderer (sig.render).
 
-from lean_graph.sig.tracker import build_index, dep_closure, DeclInfo, FieldInfo, CtorInfo
-from lean_graph.sig.render import render_decl, render_context
+The legacy pretty-printed `render_decl`/`render_context` path was removed (the
+exporter no longer emits `type_signature`/`value`/`fields[].type`/`constructors`).
+These tests exercise the live digest renderers, which build from the verbatim
+`source_text` slice.
+"""
+
+from lean_graph.sig.tracker import DeclInfo, FieldInfo
+from lean_graph.sig.render import (
+    _apply_elision,
+    _projection_names,
+    _render_decl_source,
+    render_digest,
+)
 
 
-def test_render_theorem():
-    decl = DeclInfo(
-        name="Foo.bar", kind="theorem", module="Foo",
-        is_private=False, type_signature="\u2200 x, x = x", deps=[],
+def _decl(name, kind, module, *, deps=None, source_text=None, byTactic_ranges=None,
+          decl_namespace="", line=1, docstring=None, is_private=False, fields=None):
+    return DeclInfo(
+        name=name, kind=kind, module=module, is_private=is_private,
+        deps=deps or [], line=line, source_text=source_text,
+        byTactic_ranges=byTactic_ranges, decl_namespace=decl_namespace,
+        docstring=docstring, fields=fields,
     )
-    result = render_decl(decl)
-    assert "theorem Foo.bar" in result
-    assert "\u2200 x, x = x" in result
 
 
-def test_render_structure():
-    decl = DeclInfo(
-        name="Foo.MyStruct", kind="structure", module="Foo",
-        is_private=False, type_signature="Type",
-        deps=[],
-        fields=[
-            FieldInfo(name="x", type="\u2115"),
-            FieldInfo(name="h", type="x > 0"),
-        ],
+def test_apply_elision_splices_token_over_by_block():
+    src = "theorem foo : True := by trivial"
+    start = src.encode().index(b"by trivial")
+    decl = _decl("Foo.foo", "theorem", "Foo", source_text=src,
+                 byTactic_ranges=[[start, len(src.encode())]])
+    assert _apply_elision(decl, "sorry") == "theorem foo : True := sorry"
+
+
+def test_apply_elision_no_ranges_returns_source_unchanged():
+    decl = _decl("Foo.d", "def", "Foo", source_text="def d := 5", byTactic_ranges=[])
+    assert _apply_elision(decl, "sorry") == "def d := 5"
+
+
+def test_apply_elision_handles_unicode_byte_offsets():
+    # Byte offsets, not character offsets: the proof block follows a multibyte ‖.
+    src = "theorem n : ‖x‖ = 0 := by simp"
+    b = src.encode("utf-8")
+    start = b.index(b"by simp")
+    decl = _decl("Foo.n", "theorem", "Foo", source_text=src,
+                 byTactic_ranges=[[start, len(b)]])
+    assert _apply_elision(decl, "sorry") == "theorem n : ‖x‖ = 0 := sorry"
+
+
+def test_render_decl_source_uses_slice():
+    decl = _decl("Foo.d", "def", "Foo", source_text="def d : Nat := 5")
+    assert _render_decl_source(decl) == "def d : Nat := 5"
+
+
+def test_render_decl_source_placeholder_when_no_slice():
+    out = _render_decl_source(_decl("Foo.d", "def", "Foo", source_text=None))
+    assert "no source slice" in out
+    assert "Foo.d" in out
+
+
+def test_projection_names_collects_proj_names():
+    struct = _decl("Foo.S", "structure", "Foo",
+                   fields=[FieldInfo(name="x", proj_name="Foo.S.x"),
+                           FieldInfo(name="y", proj_name="Foo.S.y")])
+    assert _projection_names([struct]) == {"Foo.S.x", "Foo.S.y"}
+
+
+def test_render_digest_print_imports_and_checks():
+    leaf = _decl("Foo.leaf", "def", "Foo.Basic", source_text="def leaf : Nat := 0")
+    thm = _decl("Foo.thm", "theorem", "Foo.Main", deps=["Foo.leaf"],
+                source_text="theorem thm : Foo.leaf = 0 := by sorry")
+    index = {d.name: d for d in (leaf, thm)}
+    out = render_digest([thm], [thm, leaf], index, root_module="Foo",
+                        module_imports={}, project_modules={"Foo.Basic", "Foo.Main"},
+                        mode="print")
+    assert "import Foo.Basic" in out
+    assert "import Foo.Main" in out
+    assert "#check @Foo.thm" in out      # theorem -> #check (statement)
+    assert "#print Foo.leaf" in out      # small non-recursive def -> #print
+    assert "TARGET" in out               # the target theorem is tagged
+
+
+def test_render_digest_self_contained_imports_mathlib_and_sorries_proofs():
+    leaf = _decl("Foo.leaf", "def", "Foo.Basic", source_text="def leaf : Nat := 0",
+                 decl_namespace="Foo")
+    thm = _decl("Foo.thm", "theorem", "Foo.Main", deps=["Foo.leaf"],
+                source_text="theorem thm : Foo.leaf = 0 := by sorry",
+                decl_namespace="Foo")
+    index = {d.name: d for d in (leaf, thm)}
+    out = render_digest(
+        [thm], [thm, leaf], index, root_module="Foo",
+        module_imports={"Foo.Basic": [], "Foo.Main": ["Foo.Basic"]},
+        project_modules={"Foo.Basic", "Foo.Main"},
+        mode="self_contained",
     )
-    result = render_decl(decl)
-    assert "structure Foo.MyStruct where" in result
-    assert "x : \u2115" in result
-    assert "h : x > 0" in result
-
-
-def test_render_structure_extends():
-    """Structure with parents should show extends and skip parent fields."""
-    decl = DeclInfo(
-        name="Foo.DensityOp", kind="structure", module="Foo",
-        is_private=False, type_signature="Nat \u2192 Type",
-        deps=["Foo.PosSemidefOp"],
-        fields=[
-            FieldInfo(name="toPosSemidefOp", type="...", from_parent=True),
-            FieldInfo(name="trace_one", type="toOp.trace = 1"),
-        ],
-        parents=["Foo.PosSemidefOp"],
-    )
-    result = render_decl(decl)
-    assert "extends PosSemidefOp" in result
-    assert "Nat \u2192 Type" in result
-    assert "trace_one" in result
-    # Parent field should NOT be shown
-    assert "toPosSemidefOp" not in result
-
-
-def test_render_structure_extends_multiple():
-    """Structure extending multiple parents."""
-    decl = DeclInfo(
-        name="Foo.Bar", kind="structure", module="Foo",
-        is_private=False, type_signature="Type",
-        deps=[],
-        fields=[
-            FieldInfo(name="toA", type="...", from_parent=True),
-            FieldInfo(name="toB", type="...", from_parent=True),
-            FieldInfo(name="myField", type="\u2115"),
-        ],
-        parents=["Foo.A", "Foo.B"],
-    )
-    result = render_decl(decl)
-    assert "extends A, B" in result
-    assert "myField : \u2115" in result
-    assert "toA" not in result
-    assert "toB" not in result
-
-
-def test_render_inductive():
-    decl = DeclInfo(
-        name="Foo.MyInd", kind="inductive", module="Foo",
-        is_private=False, type_signature="Type \u2192 Type",
-        deps=[],
-        constructors=[
-            CtorInfo(name="nil", type="Foo.MyInd \u03b1"),
-            CtorInfo(name="cons", type="\u03b1 \u2192 Foo.MyInd \u03b1 \u2192 Foo.MyInd \u03b1"),
-        ],
-    )
-    result = render_decl(decl)
-    assert "inductive Foo.MyInd" in result
-    assert "| nil" in result
-    assert "| cons" in result
-
-
-def test_render_abbrev():
-    decl = DeclInfo(
-        name="Foo.myAbbrev", kind="abbrev", module="Foo",
-        is_private=False, type_signature="Type",
-        deps=[], value="Nat",
-    )
-    result = render_decl(decl)
-    assert "abbrev Foo.myAbbrev" in result
-    assert "Nat" in result
-
-
-def test_render_context_groups_by_module():
-    targets = [
-        DeclInfo(name="A.foo", kind="def", module="A",
-                 is_private=False, type_signature="B.Bar \u2192 \u2115", deps=["B.Bar"]),
-    ]
-    context = targets + [
-        DeclInfo(name="B.Bar", kind="structure", module="B",
-                 is_private=False, type_signature="Type", deps=[],
-                 fields=[FieldInfo(name="x", type="\u2115")]),
-    ]
-    result = render_context(targets, context, root_module="Root", header="test")
-    assert "Target declarations" in result
-    assert "Required context" in result
-    assert "def A.foo" in result
-    assert "structure B.Bar" in result
-
-
-def test_render_context_filters_projections():
-    """Standalone projection declarations should be filtered when struct is present."""
-    targets = [
-        DeclInfo(name="A.foo", kind="def", module="A",
-                 is_private=False, type_signature="B.Bar \u2192 \u2115",
-                 deps=["B.Bar", "B.Bar.x"]),
-    ]
-    bar_struct = DeclInfo(
-        name="B.Bar", kind="structure", module="B",
-        is_private=False, type_signature="Type", deps=[],
-        fields=[FieldInfo(name="x", type="\u2115", proj_name="B.Bar.x")],
-    )
-    bar_proj = DeclInfo(
-        name="B.Bar.x", kind="abbrev", module="B",
-        is_private=False, type_signature="B.Bar \u2192 \u2115", deps=["B.Bar"],
-        value="fun self => self.1",
-    )
-    context = targets + [bar_struct, bar_proj]
-    result = render_context(targets, context, root_module="Root", header="test")
-    # The structure should appear
-    assert "structure B.Bar" in result
-    # The standalone projection should NOT appear
-    assert "abbrev B.Bar.x" not in result
-
-
-def test_render_class():
-    """Class declarations should render with 'class' keyword."""
-    decl = DeclInfo(
-        name="Foo.MyClass", kind="class", module="Foo",
-        is_private=False, type_signature="Type \u2192 Type",
-        deps=[],
-        fields=[FieldInfo(name="op", type="\u03b1 \u2192 \u03b1")],
-    )
-    result = render_decl(decl)
-    assert "class Foo.MyClass" in result
-    assert "op : \u03b1 \u2192 \u03b1" in result
-
-
-def test_render_sorry_warning():
-    """Declarations with sorry should show a warning."""
-    decl = DeclInfo(
-        name="Foo.bar", kind="theorem", module="Foo",
-        is_private=False, type_signature="\u2200 x, x = x", deps=[],
-        has_sorry=True,
-    )
-    result = render_decl(decl)
-    assert "sorry" in result.lower()
-    assert "WARNING" in result or "\u26a0" in result
-
-
-def test_render_no_sorry_warning():
-    """Declarations without sorry should not show a warning."""
-    decl = DeclInfo(
-        name="Foo.bar", kind="theorem", module="Foo",
-        is_private=False, type_signature="\u2200 x, x = x", deps=[],
-        has_sorry=False,
-    )
-    result = render_decl(decl)
-    assert "sorry" not in result.lower()
-
-
-def test_render_context_leaves_first():
-    """Leaf dependencies should appear before intermediate ones (reversed BFS)."""
-    targets = [
-        DeclInfo(name="A.top", kind="def", module="A",
-                 is_private=False, type_signature="B.Mid \u2192 \u2115", deps=["B.Mid"]),
-    ]
-    mid = DeclInfo(name="B.Mid", kind="structure", module="B",
-                   is_private=False, type_signature="Type", deps=["C.Leaf"],
-                   fields=[FieldInfo(name="x", type="C.Leaf")])
-    leaf = DeclInfo(name="C.Leaf", kind="structure", module="C",
-                    is_private=False, type_signature="Type", deps=[],
-                    fields=[FieldInfo(name="v", type="\u2115")])
-    # BFS order: Mid, Leaf. Reversed: Leaf, Mid.
-    context = targets + [mid, leaf]
-    result = render_context(targets, context, root_module="Root", header="test")
-    # Check within the context section only (after "Required context")
-    ctx_section = result[result.index("Required context"):]
-    leaf_pos = ctx_section.index("structure C.Leaf")
-    mid_pos = ctx_section.index("structure B.Mid")
-    assert leaf_pos < mid_pos, "Leaf dependencies should appear before intermediate ones"
+    assert "import Mathlib" in out
+    assert "def leaf : Nat := 0" in out  # leaf re-declared verbatim
+    assert "namespace Foo" in out        # placed under its real namespace
+    assert "sorry" in out                # the theorem body is sorried
