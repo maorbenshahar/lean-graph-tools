@@ -41,6 +41,16 @@ class DeclInfo:
     parents: Optional[list[str]] = None  # Parent structure names (from extends)
     has_sorry: bool = False
     docstring: Optional[str] = None
+    # v3 source-slice fields (audit-digest renderer). `source_text` is the verbatim
+    # source of the declaration: signature + ` := by sorry` for proof-bearing decls,
+    # whole decl verbatim otherwise. None when the exporter had no source range.
+    source_text: Optional[str] = None
+    # Byte spans (relative to source_text's UTF-8) of the outermost `by` proof
+    # blocks, so a renderer can elide them with its own token (`sorry` for live
+    # re-declared code, `⋯` for a comment). Empty/None when there's nothing to elide.
+    byTactic_ranges: Optional[list] = None
+    # Namespace open at the declaration's source position (e.g. "Quantum.Operators").
+    decl_namespace: str = ""
 
 
 def build_index(data: dict) -> dict[str, DeclInfo]:
@@ -77,8 +87,38 @@ def build_index(data: dict) -> dict[str, DeclInfo]:
             parents=d.get("parents"),
             has_sorry=d.get("has_sorry", False),
             docstring=d.get("docstring"),
+            source_text=d.get("source_text"),
+            byTactic_ranges=d.get("byTactic_ranges"),
+            decl_namespace=d.get("decl_namespace", ""),
         )
     return index
+
+
+class SigData:
+    """Top-level export payload: index plus the v3 scope/import maps.
+
+    Centralises access to the maps the audit-digest assembler needs so the CLI
+    and the loopy wrapper read them the same way. All maps are keyed by full
+    module name.
+    """
+
+    def __init__(self, data: dict):
+        self.root_module: str = data.get("root_module", "")
+        self.index: dict[str, DeclInfo] = build_index(data)
+        self.project_modules: set[str] = set(data.get("project_modules", []))
+        self.module_imports: dict[str, list[str]] = data.get("module_imports", {})
+        self.module_opens: dict[str, list[str]] = data.get("module_opens", {})
+        self.module_notations: dict[str, list[str]] = data.get("module_notations", {})
+        self.module_variables: dict[str, list[str]] = data.get("module_variables", {})
+        # All non-decl, non-structural, non-notation context commands per module,
+        # verbatim in source order (opens + variables + attributes + set_options +
+        # universes). Subsumes module_opens/module_variables for import_copies.
+        self.module_context: dict[str, list[str]] = data.get("module_context", {})
+
+    @property
+    def has_source_text(self) -> bool:
+        """True if the export carries the v3 source-slice fields."""
+        return any(d.source_text is not None for d in self.index.values())
 
 
 def dep_closure(index: dict[str, DeclInfo],

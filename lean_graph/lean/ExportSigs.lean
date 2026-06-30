@@ -513,6 +513,704 @@ def getCtorTypeDeps (env : Environment) (name : Name) : Array Name :=
         | some ctorInfo => acc ++ ctorInfo.type.getUsedConstants
     | _ => #[]
 
+-- ============================================================================
+-- Verbatim source slicing + scope capture (additive: `source_text`,
+-- `decl_namespace`, `module_opens`, `module_notations`, `module_variables`,
+-- `module_context`).
+--
+-- The pretty-printed `type_signature`/`value` fields above are elaborated and do
+-- NOT round-trip to compiling source. The fields below are raw byte slices of the
+-- original `.lean` file, taken after parsing each module with Lean's own frontend
+-- (so scoped notation parses). Existing fields are untouched.
+-- ============================================================================
+
+/-- First descendant (pre-order) whose kind is one of `kinds`. -/
+partial def findFirstNode (stx : Syntax) (kinds : List Name) : Option Syntax :=
+  if kinds.contains stx.getKind then some stx
+  else match stx with
+    | .node _ _ args => args.findSome? (fun a => findFirstNode a kinds)
+    | _ => none
+
+/-- Byte position of a declaration command's leading KEYWORD
+    (`def`/`theorem`/`structure`/`class`/`instance`/`abbrev`/`opaque`/`axiom`/
+    `lemma`/…), i.e. the start of the actual declaration syntax AFTER any leading
+    doc-comment, attributes, and modifiers (`private`/`noncomputable`/…).
+
+    A `Command.declaration` wraps a leading `declModifiers` child (doc-comment +
+    attributes + modifiers) followed by the inner decl node (`Command.definition`,
+    `Command.theorem`, `Command.structure`, `Command.instance`, …); that inner
+    node's position is the keyword. A top-level `lemma` is its own command kind
+    with the same leading `declModifiers`, so dropping the `declModifiers` child
+    and taking the next child's position yields the keyword there too. Falls back
+    to the command's own start position when the shape is unexpected. -/
+def declKeywordPos (cmd : Syntax) : Option String.Pos.Raw :=
+  match cmd with
+  | .node _ k args =>
+    if k == `Lean.Parser.Command.declaration then
+      (args[1]?.bind (·.getPos?)) <|> cmd.getPos?
+    else
+      let rest := args.filter (fun a => a.getKind != `Lean.Parser.Command.declModifiers)
+      (rest[0]?.bind (·.getPos?)) <|> cmd.getPos?
+  | _ => cmd.getPos?
+
+/-- Syntax kind of a `by tac` tactic-block term. (`Term.byTactic'`, used only by
+    `show`/`suffices`, is intentionally NOT matched: replacing it would leave an
+    invalid `show T sorry`.) -/
+def byTacticKind : Name := `Lean.Parser.Term.byTactic
+
+/-- Source byte ranges `[start, stop)` of the OUTERMOST `by` tactic-block term
+    nodes (`Lean.Parser.Term.byTactic`) in `stx`, in pre-order. A `byTactic`
+    nested inside another is NOT collected separately — recursion stops at each
+    outermost hit, so `by foo (by bar)` yields a single range covering the whole
+    outer block. Nodes with missing source positions are skipped. -/
+partial def collectOutermostByTactics (stx : Syntax) : Array (Nat × Nat) :=
+  go stx #[]
+where
+  go (s : Syntax) (acc : Array (Nat × Nat)) : Array (Nat × Nat) :=
+    if s.getKind == byTacticKind then
+      match s.getPos?, s.getTailPos? with
+      | some a, some b => acc.push (a.byteIdx, b.byteIdx)
+      | _, _ => acc
+    else match s with
+      | .node _ _ args => args.foldl (fun acc a => go a acc) acc
+      | _ => acc
+
+/-- Raw source slice for byte range `[b, e)`. Parser positions sit on UTF-8
+    boundaries, so `String.fromUTF8!` never panics here. -/
+def sliceBytes (bytes : ByteArray) (b e : Nat) : String :=
+  String.fromUTF8! (bytes.extract b e)
+
+private def isHWs (c : Char) : Bool :=
+  c == ' ' || c == '\t' || c == '\n' || c == '\r'
+
+/-- Drop trailing whitespace (spaces, tabs, CR, LF) from a slice. -/
+def dropTrailingWs (s : String) : String :=
+  (s.toList.reverse.dropWhile isHWs).reverse.foldl (·.push ·) ""
+
+/-- Map a module name to its source path relative to the project root (cwd). -/
+def modToSrcPath (mod : Name) : System.FilePath :=
+  (System.FilePath.mk (String.intercalate "/" (mod.components.map (·.toString)))).addExtension "lean"
+
+/-- `declVal` node kinds: the start of a declaration body (`:=` / `where`). -/
+def declValKinds : List Name :=
+  [`Lean.Parser.Command.declValSimple, `Lean.Parser.Command.declValEqns,
+   `Lean.Parser.Command.whereStructInst]
+
+/-- Notation / macro-style command kinds whose verbatim slice is surfaced per
+    module. `mixfix` covers `infix`/`infixl`/`infixr`/`prefix`/`postfix`;
+    `Mathlib.Notation3.notation3` is Mathlib's `notation3`. -/
+def notationKinds : List Name :=
+  [`Lean.Parser.Command.notation, `Lean.Parser.Command.mixfix,
+   `Lean.Parser.Command.macro, `Lean.Parser.Command.macro_rules,
+   `Lean.Parser.Command.syntax, `Mathlib.Notation3.notation3]
+
+/-- True if `cmd` is a notation/macro/syntax/notation3 command. -/
+def isNotationCmd (cmd : Syntax) : Bool :=
+  let k := cmd.getKind
+  notationKinds.contains k || (k.components.getLast?.map (· == `notation3)).getD false
+
+-- ----------------------------------------------------------------------------
+-- Per-notation metadata extraction (purely syntactic; no name resolution).
+--
+-- For each captured notation-family command we surface, besides its verbatim
+-- `text`, a `kind` string, the literal token atoms it introduces (`tokens`),
+-- and the raw identifier leaves of its right-hand side / macro expansion
+-- (`rhs_idents`). The Python side resolves `rhs_idents` against the project decl
+-- index by suffix-match; identifiers that don't match (Mathlib names, antiquot
+-- pattern variables, local binders) are simply ignored, so over-collection is
+-- harmless. Extraction never elaborates or resolves anything.
+-- ----------------------------------------------------------------------------
+
+/-- True if `k` is (or contains) a quotation antiquotation kind such as
+    `term.pseudo.antiquot`. Subtrees under such a kind hold antiquotation
+    variables (`$x`, `$xs`), not literal tokens or referenced constants, so they
+    are skipped during token/ident collection. -/
+def kindIsAntiquot (k : Name) : Bool :=
+  (k.toString.splitOn "antiquot").length ≥ 2
+
+/-- True if `k` is a syntax-quotation kind (`` `(…) ``) of any category —
+    `Lean.Parser.Term.quot`, `Lean.Parser.Tactic.quot`, etc. — but NOT an
+    antiquotation. The identifiers inside such a node are the constants a macro
+    expansion references. -/
+def kindIsQuot (k : Name) : Bool :=
+  !kindIsAntiquot k && (k.toString.splitOn "quot").length ≥ 2
+
+/-- True for the ASCII whitespace bytes (space, tab, LF, CR). UTF-8 lead and
+    continuation bytes are all ≥ 0x80, so this never matches inside a multi-byte
+    character. -/
+def isWsByte (b : UInt8) : Bool := b == 32 || b == 9 || b == 10 || b == 13
+
+/-- First byte offset in `[start, stop)` that is not ASCII whitespace (or `stop`
+    if all whitespace). Used to start a verbatim slice at the first real token
+    after a dropped leading doc-comment. -/
+partial def skipLeadingWsBytes (bytes : ByteArray) (start stop : Nat) : Nat :=
+  if start < stop && isWsByte bytes[start]! then skipLeadingWsBytes bytes (start + 1) stop
+  else start
+
+/-- Order-preserving de-duplication of a string array. -/
+def dedupStrings (a : Array String) : Array String :=
+  a.foldl (fun out s => if out.contains s then out else out.push s) #[]
+
+/-- Collect every string-literal leaf (`Syntax.isStrLit?`) in a subtree. These
+    are the literal token atoms a `notation`/`mixfix`/`syntax`/`macro` parser
+    spec introduces (e.g. `"|0⟩"`, `" ⊗ "`, `"|"`). -/
+partial def collectStrLits (acc : Array String) (s : Syntax) : Array String :=
+  match s.isStrLit? with
+  | some lit => acc.push lit
+  | none =>
+    match s with
+    | .node _ _ args => args.foldl collectStrLits acc
+    | _ => acc
+
+/-- Collect every (non-anonymous) identifier leaf in a subtree, skipping
+    antiquotation subtrees so that pattern variables (`$x`) are not collected.
+    Identifiers are taken raw (`Name.toString`), unresolved. -/
+partial def collectIdentLeaves (acc : Array String) (s : Syntax) : Array String :=
+  match s with
+  | .ident _ _ v _ => if v == Name.anonymous then acc else acc.push v.toString
+  | .node _ k args => if kindIsAntiquot k then acc else args.foldl collectIdentLeaves acc
+  | _ => acc
+
+/-- Collect every string-literal leaf that is NOT inside a syntax quotation.
+    For `macro`/`elab` these are the parser-spec tokens (e.g. `"qisimp_basic"`),
+    keeping literals that belong to the quoted expansion body out of `tokens`. -/
+partial def collectStrLitsOutsideQuot (acc : Array String) (s : Syntax) : Array String :=
+  match s.isStrLit? with
+  | some lit => acc.push lit
+  | none =>
+    match s with
+    | .node _ k args => if kindIsQuot k then acc else args.foldl collectStrLitsOutsideQuot acc
+    | _ => acc
+
+/-- True if a subtree contains a syntax quotation (`` `(…) `` of any category). -/
+partial def subtreeHasQuot (s : Syntax) : Bool :=
+  match s with
+  | .node _ k args => kindIsQuot k || args.any subtreeHasQuot
+  | _ => false
+
+/-- Collect identifier leaves that occur INSIDE syntax quotations, skipping
+    antiquotation variables. Used for `macro`/`macro_rules`/`elab_rules`
+    expansions where the referenced constants live in the quoted body and the
+    surrounding `do`-block idents (`result`, `getElems`, …) are not what we want. -/
+partial def collectQuotIdentLeaves (acc : Array String) (s : Syntax) : Array String :=
+  match s with
+  | .node _ k args =>
+    if kindIsQuot k then collectIdentLeaves acc s
+    else if kindIsAntiquot k then acc
+    else args.foldl collectQuotIdentLeaves acc
+  | _ => acc
+
+/-- Collect literal atom values from a quotation pattern, skipping antiquotation
+    subtrees and the quotation delimiters (`` `( ``, `)`). These are the literal
+    tokens a `macro_rules`/`elab_rules` match pattern introduces (e.g. `⟨`, `,`,
+    `|` for a `⟨ … |` bra pattern). -/
+partial def collectPatternAtoms (acc : Array String) (s : Syntax) : Array String :=
+  match s with
+  | .atom _ v => if v.startsWith "`(" || v == ")" then acc else acc.push v
+  | .node _ k args => if kindIsAntiquot k then acc else args.foldl collectPatternAtoms acc
+  | _ => acc
+
+/-- Collect pattern atoms from every syntax quotation in a subtree. -/
+partial def collectQuotAtoms (acc : Array String) (s : Syntax) : Array String :=
+  match s with
+  | .node _ k args =>
+    if kindIsQuot k then collectPatternAtoms acc s
+    else args.foldl collectQuotAtoms acc
+  | _ => acc
+
+/-- Collect every `matchAlt` node in a subtree (the `| pat => rhs` arms of a
+    `macro_rules`/`elab_rules` command). -/
+partial def collectMatchAlts (acc : Array Syntax) (s : Syntax) : Array Syntax :=
+  match s with
+  | .node _ k args =>
+    let acc := if k == `Lean.Parser.Term.matchAlt then acc.push s else acc
+    args.foldl collectMatchAlts acc
+  | _ => acc
+
+/-- Split a command's direct args at the first top-level `=>` atom into the
+    parser-spec part (before) and the RHS-term part (after). `none` when there is
+    no top-level `=>` (e.g. a `syntax` command, or `macro_rules` whose `=>` sit
+    inside nested match arms). -/
+def argsSplitOnArrow (args : Array Syntax) : Option (Array Syntax × Array Syntax) :=
+  match args.findIdx? (fun a => match a with | .atom _ v => v == "=>" | _ => false) with
+  | some i => some (args.extract 0 i, args.extract (i + 1) args.size)
+  | none => none
+
+/-- The specific mixfix keyword (`infixl`/`infixr`/`infix`/`prefix`/`postfix`)
+    of a `Lean.Parser.Command.mixfix` node, read from its keyword child node;
+    `"mixfix"` if none is found. -/
+def mixfixKeyword (inner : Syntax) : String :=
+  let kws := ["infixl", "infixr", "infix", "prefix", "postfix"]
+  match inner.getArgs.findSome? (fun a =>
+    match a.getKind.components.getLast?.map (·.toString) with
+    | some s => if kws.contains s then some s else none
+    | none => none) with
+  | some s => s
+  | none => "mixfix"
+
+/-- The `kind` string for a captured notation-family command: the specific
+    mixfix keyword for `mixfix`, otherwise the last component of the command kind
+    (`notation`, `macro_rules`, `syntax`, `macro`, `notation3`, …). -/
+def notationKindString (inner : Syntax) : String :=
+  let k := inner.getKind
+  if k == `Lean.Parser.Command.mixfix then mixfixKeyword inner
+  else (k.components.getLast?.map (·.toString)).getD "notation"
+
+/-- Peel off `… in <cmd>` wrappers (kind `Lean.Parser.Command.in`, e.g.
+    `set_option … in`, possibly nested) to reach the innermost wrapped command. -/
+partial def unwrapInCommands (cmd : Syntax) : Syntax :=
+  if cmd.getKind == `Lean.Parser.Command.in then
+    match cmd.getArgs.back? with
+    | some inner => unwrapInCommands inner
+    | none => cmd
+  else cmd
+
+/-- The inner notation-family command of a top-level command, looking through any
+    `… in` wrappers, or `none` if the (unwrapped) command is not a notation-family
+    command. The verbatim `text` is sliced from the OUTER command (so a
+    `set_option … in` prefix is retained); tokens/idents come from this inner. -/
+def notationInnerCmd? (cmd : Syntax) : Option Syntax :=
+  let inner := unwrapInCommands cmd
+  if isNotationCmd inner then some inner else none
+
+/-- Identifier leaves of a notation RHS. When the RHS contains a term quotation
+    (macro expansion), restrict to identifiers inside quotations; otherwise take
+    all identifier leaves of the plain RHS term. -/
+def rhsIdentsOfArgs (after : Array Syntax) : Array String :=
+  if after.any subtreeHasQuot then after.foldl collectQuotIdentLeaves #[]
+  else after.foldl collectIdentLeaves #[]
+
+/-- `(tokens, rhs_idents)` for a `macro_rules`/`elab_rules` command: pattern atoms
+    of each match arm's LHS quotation, and identifier leaves of each arm's RHS
+    expansion quotations. -/
+def notationMetaFromMatchAlts (inner : Syntax) : Array String × Array String :=
+  (collectMatchAlts #[] inner).foldl (init := (#[], #[]))
+    fun (acc : Array String × Array String) alt =>
+      match argsSplitOnArrow alt.getArgs with
+      | some (before, after) =>
+        (before.foldl collectQuotAtoms acc.1, after.foldl collectQuotIdentLeaves acc.2)
+      | none => acc
+
+/-- `(tokens, rhs_idents)` for any captured notation-family inner command,
+    dispatched on its kind:
+
+    * `syntax` — tokens are all string-literal atoms of the parser spec; no RHS.
+    * `macro_rules` / `elab_rules` — per match arm (`notationMetaFromMatchAlts`).
+    * `macro` (and any notation whose body is a syntax quotation, e.g. a tactic
+      macro): tokens are the string literals OUTSIDE the quotation, `rhs_idents`
+      the identifier leaves inside the expansion quotation.
+    * everything else (`notation` / `mixfix` / `notation3` / …) — split on the
+      top-level `=>`: tokens are the string-literal atoms before it, `rhs_idents`
+      the identifier leaves after it.
+
+    Both lists are order-preserving de-duplicated. -/
+def notationTokensIdents (inner : Syntax) : Array String × Array String :=
+  let k := inner.getKind
+  let raw :=
+    if k == `Lean.Parser.Command.syntax then
+      (collectStrLits #[] inner, (#[] : Array String))
+    else if k == `Lean.Parser.Command.macro_rules || k == `Lean.Parser.Command.elab_rules then
+      notationMetaFromMatchAlts inner
+    else if subtreeHasQuot inner then
+      (collectStrLitsOutsideQuot #[] inner, collectQuotIdentLeaves #[] inner)
+    else
+      match argsSplitOnArrow inner.getArgs with
+      | some (before, after) => (before.foldl collectStrLits #[], rhsIdentsOfArgs after)
+      | none => (collectStrLits #[] inner, (#[] : Array String))
+  (dedupStrings raw.1, dedupStrings raw.2)
+
+/-- True if `cmd` declares one or more constants. Top-level `lemma` is its own
+    kind (not wrapped in `Command.declaration`); everything else
+    (def/theorem/abbrev/structure/inductive/instance/opaque/axiom/example) is a
+    `Command.declaration`. -/
+def isDeclCmd (cmd : Syntax) : Bool :=
+  let k := cmd.getKind
+  k == `Lean.Parser.Command.declaration || k.toString.endsWith "lemma"
+
+/-- Command kinds whose elaboration updates parser-relevant scope: namespace /
+    section nesting and the set of `open`ed (and `open scoped`) namespaces govern
+    which scoped notations are active when parsing subsequent declarations;
+    `set_option` can change parser behaviour; `universe`/`variable` round out the
+    scope state. These never import library modules, so elaborating them against
+    the global environment is cheap. -/
+def contextCmdKinds : List Name :=
+  [`Lean.Parser.Command.namespace, `Lean.Parser.Command.section,
+   `Lean.Parser.Command.end, `Lean.Parser.Command.open,
+   `Lean.Parser.Command.variable, `Lean.Parser.Command.universe,
+   `Lean.Parser.Command.set_option]
+
+/-- True if `cmd` is a context command that must be elaborated (against the global
+    environment) to keep the scoped-notation parser state correct for parsing the
+    declarations that follow it: a scope command (`contextCmdKinds`), a
+    notation/macro/syntax command (`isNotationCmd`), or an `elab`/`elab_rules`/
+    `declare_syntax_cat` command that registers new term syntax. -/
+def isContextCmd (cmd : Syntax) : Bool :=
+  let k := cmd.getKind
+  contextCmdKinds.contains k
+    || isNotationCmd cmd
+    || (k.components.getLast?.map
+          (fun c => c == `elab || c == `elab_rules || c == `declare_syntax_cat)
+        ).getD false
+
+/-- True if `cmd` is a top-level command whose verbatim slice belongs in a
+    module's `module_context` — the elaboration context a downstream verbatim copy
+    must reproduce to elaborate. This is every top-level command EXCEPT:
+
+    * declarations (`isDeclCmd`: def/theorem/abbrev/structure/inductive/instance/
+      opaque/axiom/example/lemma), `mutual` blocks, and `… in <cmd>` wrappers
+      (kind `Lean.Parser.Command.in`, e.g. `set_option … in <decl>`,
+      `attribute … in <decl>`) — each carries a declaration body the copy already
+      emits separately, so re-emitting it would duplicate the declaration;
+    * structural scope delimiters (`namespace`/`section`/`end`) — the copy is
+      wrapped in its own namespace that opens the real ones;
+    * notation/macro/syntax + elab-family commands (`isNotationCmd` plus
+      `elab`/`elab_rules`/`declare_syntax_cat`) — the real imported modules already
+      provide them, so re-emitting would redundantly re-declare notation;
+    * module doc comments (`/-! … -/`, kind `moduleDoc`) — documentation, not
+      elaboration context.
+
+    What remains — `open`, `open scoped`, `variable`, `set_option`, `attribute`,
+    `universe`, and any other contextual command — is captured verbatim, in source
+    order, so a downstream copy can reproduce the module's local instances, option
+    settings, opened namespaces, and section variables. The capture site
+    additionally drops `#`-prefixed diagnostic commands (`#check`/`#eval`/… ), which
+    are non-contextual and could error or run IO if re-emitted. -/
+def isModuleContextCmd (cmd : Syntax) : Bool :=
+  let k := cmd.getKind
+  if isDeclCmd cmd then false
+  else if k == `Lean.Parser.Command.mutual || k == `Lean.Parser.Command.in then false
+  else if k == `Lean.Parser.Command.namespace || k == `Lean.Parser.Command.section
+       || k == `Lean.Parser.Command.end then false
+  else if k == `Lean.Parser.Command.moduleDoc then false
+  else if isNotationCmd cmd then false
+  else if (k.components.getLast?.map
+            (fun c => c == `elab || c == `elab_rules || c == `declare_syntax_cat)).getD false then false
+  else true
+
+/-- Name opened by a `namespace Foo.Bar` command (`anonymous` if not found). -/
+def namespaceCmdName (cmd : Syntax) : Name :=
+  (cmd.getArgs[1]?.map (·.getId)).getD .anonymous
+
+/-- The current namespace string from a scope stack. `some n` frames are
+    `namespace` openings (contribute their name); `none` frames are `section`
+    openings (contribute nothing). The stack is innermost-first. -/
+def stackNamespace (stack : List (Option Name)) : String :=
+  String.intercalate "." ((stack.reverse.filterMap id).map (·.toString))
+
+/-- Source-slice boundaries + active namespace for one declaration command. -/
+structure SliceInfo where
+  /-- Byte offset of the declaration start, taken from the env's `declRangeExt`
+      range (the start of the docstring / attributes / modifiers). -/
+  startByte    : Nat
+  /-- Byte offset one past the declaration end, taken from the env's `declRangeExt`
+      range. Authoritative even when the parse-only command Syntax was truncated. -/
+  tailByte     : Nat
+  /-- Byte offset of the declaration body (`:=` / `where`), from the parse-only
+      command. Kept only when it lies inside `[startByte, tailByte]`; `none` forces
+      a whole-declaration verbatim slice (the correct fallback for truncated parses). -/
+  declValByte? : Option Nat
+  /-- Byte ranges of the OUTERMOST `by` tactic-block terms inside this declaration,
+      each filtered to lie within `[startByte, tailByte]`, as ABSOLUTE source byte
+      offsets. `source_text` is emitted as the RAW verbatim slice (no pre-splicing);
+      these ranges are re-emitted (rebased onto the slice start) as `byTactic_ranges`
+      so the consumer can splice its own elision token (`sorry` for live re-declared
+      copies, `⋯` for commented digests) over the proof bodies. -/
+  byTacticRanges : Array (Nat × Nat)
+  /-- 1-indexed source line of the declaration KEYWORD (`def`/`theorem`/`structure`/…),
+      taken from the parse-only command after skipping any leading doc-comment,
+      attributes, and modifiers. `none` when the keyword position is unavailable
+      (falls back to the `declRangeExt` selection range at emit time). -/
+  keywordLine : Option Nat
+  /-- Namespace open at this command's position (`""` if none). -/
+  declNamespace : String
+
+/-- Parsed, slice-ready view of one module's source. -/
+structure ModuleSlice where
+  /-- Raw UTF-8 source bytes. -/
+  bytes : ByteArray
+  /-- Primary declaration name → slice boundaries + namespace. The primary name of
+      a command is the earliest-starting declared constant in it, tie-broken to the
+      shortest name (the structure/inductive/def itself, not its projections/ctors). -/
+  nameToCmd : Std.HashMap Name SliceInfo
+  /-- Verbatim slices of `open` / `open scoped` commands, in source order. -/
+  opens : Array String
+  /-- Per-notation metadata objects (`text`/`line`/`kind`/`tokens`/`rhs_idents`)
+      for notation/macro/syntax commands, including those wrapped in
+      `set_option … in`, in source order. -/
+  notations : Array Json
+  /-- Verbatim slices of file-level `variable` commands, in source order. -/
+  variables : Array String
+  /-- Verbatim slices of every context command (`isModuleContextCmd`: opens,
+      `open scoped`, `variable`, `set_option`, `attribute`, `universe`, …), in
+      source order. Superset of `opens`/`variables`; excludes declarations,
+      `namespace`/`section`/`end`, and notation-family commands. -/
+  contextCmds : Array String
+
+/-- Parse a module's source against the GLOBAL imported environment and build a
+    `ModuleSlice`: declaration → slice boundaries (with active namespace) plus the
+    verbatim open/notation/variable/context-command slices. Returns `none` if the
+    source file is missing.
+
+    Slice boundaries come from the env's `declRangeExt` range (authoritative end,
+    robust to truncated parse-only command Syntax), NOT from the parse-only
+    command's tail position; the parse-only command supplies only the declaration
+    body boundary (`:=` / `where`) and the active namespace/scope state.
+
+    Memory invariant: this NEVER re-imports the module's transitive dependencies
+    and NEVER re-elaborates its declarations. The single `globalEnv` (already
+    holding every project + library module and every parser/notation extension) is
+    reused for every module in the export, so peak memory is independent of the
+    module count.
+
+    Mechanism: parse the header only to skip past the `import` lines (the global
+    env already supplies every import), then drive a manual command loop seeded
+    with a `Command.State` over `globalEnv`. For each parsed command:
+
+    * CONTEXT commands (`isContextCmd`: namespace/section/end/open/variable/
+      universe/set_option and the notation/macro/syntax/elab families) are
+      elaborated so scoped notation / open / section state is correct for parsing
+      the declarations that follow. These are cheap and pull in no library module.
+      Elaboration errors are logged to stderr and skipped (best-effort).
+    * DECLARATION commands are parsed only — their `Syntax` drives source slicing.
+      They are NOT elaborated: the global env already contains the elaborated
+      decls, and re-declaring them would both clash and reintroduce the per-module
+      memory cost this design eliminates.
+
+    Byte positions come from `declRangeExt.find? globalEnv` over the module's own
+    `constNames`; those positions are in the module's source, matching the
+    `fileMap` of the source we read. Private declarations already carry their
+    imported mangled names in `constNames`, so no `setMainModule` is needed. -/
+unsafe def parseModuleForSlicing (globalEnv : Environment) (mod : Name)
+    (constNames : Array Name) : IO (Option ModuleSlice) := do
+  let srcPath := modToSrcPath mod
+  unless (← srcPath.pathExists) do return none
+  let input ← IO.FS.readFile srcPath
+  let bytes := input.toByteArray
+  let inputCtx := Lean.Parser.mkInputContext input srcPath.toString
+  let fm := inputCtx.fileMap
+  -- Parse (and discard) the header: we need only the parser position past the
+  -- `import` lines. The global env already supplies every imported module.
+  let (_, headerState, headerMessages) ← Lean.Parser.parseHeader inputCtx
+  -- Byte span of every constant declared in this module, read from the GLOBAL
+  -- env's declaration ranges (no per-module elaboration). `spanByName` holds the
+  -- authoritative [start, end) used for slicing; `posNames` (start byte → name)
+  -- drives command → primary-declaration association in the parse loop.
+  let mut posNames : Array (Nat × Name) := #[]
+  let mut spanByName : Std.HashMap Name (Nat × Nat) := {}
+  for name in constNames do
+    match declRangeExt.find? globalEnv name with
+    | some r =>
+      let sB := (fm.ofPosition r.range.pos).byteIdx
+      let eB := (fm.ofPosition r.range.endPos).byteIdx
+      posNames := posNames.push (sB, name)
+      spanByName := spanByName.insert name (sB, eB)
+    | none => pure ()
+  let mut nameToCmd : Std.HashMap Name SliceInfo := {}
+  let mut opens : Array String := #[]
+  let mut notations : Array Json := #[]
+  let mut variables : Array String := #[]
+  let mut contextCmds : Array String := #[]
+  let mut nsStack : List (Option Name) := []
+  -- Manual command loop seeded with the global env. Holds exactly ONE environment
+  -- for the whole run (context-command elaboration only ever mutates a small delta
+  -- on top of the shared `globalEnv`, discarded when this module is done).
+  let mut cmdState := Lean.Elab.Command.mkState globalEnv headerMessages {}
+  let mut pstate := headerState
+  repeat
+    let scope := cmdState.scopes.head!
+    let pmctx : Lean.Parser.ParserModuleContext :=
+      { env := cmdState.env, options := scope.opts,
+        currNamespace := scope.currNamespace, openDecls := scope.openDecls }
+    let cmdPos := pstate.pos
+    let (cmd, pstate', msgs') :=
+      Lean.Parser.parseCommand inputCtx pmctx pstate cmdState.messages
+    pstate := pstate'
+    cmdState := { cmdState with messages := msgs' }
+    if Lean.Parser.isTerminalCommand cmd then break
+    -- Keep parser scope correct for subsequent declarations by elaborating only
+    -- context commands. Declarations are never re-elaborated.
+    if isContextCmd cmd then
+      let cmdCtx : Lean.Elab.Command.Context :=
+        { cmdPos := cmdPos, fileName := inputCtx.fileName, fileMap := fm,
+          snap? := none, cancelTk? := none }
+      match ← (((Lean.Elab.Command.elabCommand cmd) cmdCtx).run cmdState).toIO' with
+      | .ok (_, st) => cmdState := st
+      | .error ex =>
+        IO.eprintln s!"[ExportSigs] {mod}: skipped context command at byte \
+          {cmdPos.byteIdx}: {← ex.toMessageData.toString}"
+    -- Capture the verbatim slice of every context command (opens, `open scoped`,
+    -- `variable`, `set_option`, `attribute`, `universe`, …) in source order. These
+    -- parse cleanly, so their `getPos?`/`getTailPos?` range is exact. This runs
+    -- independently of the classification below (a command can be both a context
+    -- command and an `open`/`variable` captured into the dedicated arrays).
+    if isModuleContextCmd cmd then
+      match cmd.getPos?, cmd.getTailPos? with
+      | some a, some b =>
+        let sl := dropTrailingWs (sliceBytes bytes a.byteIdx b.byteIdx)
+        -- Drop `#`-prefixed diagnostic commands (`#check`/`#eval`/…): non-contextual.
+        -- `getPos?` sits on the first token (after leading trivia), so the slice has
+        -- no leading whitespace and a `#` command starts the slice directly.
+        unless sl.startsWith "#" do
+          contextCmds := contextCmds.push sl
+      | _, _ => pure ()
+    -- Source slicing + scope-slice capture (identical classification to before).
+    let k := cmd.getKind
+    if k == `Lean.Parser.Command.namespace then
+      nsStack := some (namespaceCmdName cmd) :: nsStack
+    else if k == `Lean.Parser.Command.section then
+      nsStack := none :: nsStack
+    else if k == `Lean.Parser.Command.end then
+      nsStack := match nsStack with | _ :: rest => rest | [] => []
+    else if k == `Lean.Parser.Command.open then
+      match cmd.getPos?, cmd.getTailPos? with
+      | some a, some b => opens := opens.push (dropTrailingWs (sliceBytes bytes a.byteIdx b.byteIdx))
+      | _, _ => pure ()
+    else if let some inner := notationInnerCmd? cmd then
+      -- Notation-family command, possibly wrapped in `set_option … in` (kind
+      -- `Lean.Parser.Command.in`). The verbatim `text` is sliced from the OUTER
+      -- `cmd` so any `set_option … in` prefix is retained (required to re-declare
+      -- precheck-disabled notations); `kind`/`tokens`/`rhs_idents` come from the
+      -- INNER notation command.
+      match cmd.getPos?, cmd.getTailPos? with
+      | some a, some b =>
+        -- Exclude a leading doc-comment from the slice: if `cmd`'s first
+        -- doc-comment starts exactly at the command start, begin after it (and
+        -- past the whitespace up to the first real token).
+        let startPos := match findFirstNode cmd [`Lean.Parser.Command.docComment] with
+          | some dc =>
+            match dc.getPos?, dc.getTailPos? with
+            | some dcS, some dcE => if dcS.byteIdx == a.byteIdx then dcE else a
+            | _, _ => a
+          | none => a
+        let startB := skipLeadingWsBytes bytes startPos.byteIdx b.byteIdx
+        let text := dropTrailingWs (sliceBytes bytes startB b.byteIdx)
+        let (toks, ids) := notationTokensIdents inner
+        notations := notations.push <| Json.mkObj [
+          ("text", .str text),
+          ("line", .num (fm.toPosition startPos).line),
+          ("kind", .str (notationKindString inner)),
+          ("tokens", .arr (toks.map .str)),
+          ("rhs_idents", .arr (ids.map .str))
+        ]
+      | _, _ => pure ()
+    else if k == `Lean.Parser.Command.variable then
+      match cmd.getPos?, cmd.getTailPos? with
+      | some a, some b => variables := variables.push (dropTrailingWs (sliceBytes bytes a.byteIdx b.byteIdx))
+      | _, _ => pure ()
+    else if isDeclCmd cmd then
+      match cmd.getPos?, cmd.getTailPos? with
+      | some cs, some ct =>
+        let cmdStartB := cs.byteIdx
+        let cmdTailB := ct.byteIdx
+        let dvB? := (findFirstNode cmd declValKinds).bind (·.getPos?) |>.map (·.byteIdx)
+        let cands := posNames.filter (fun (b, _) => cmdStartB ≤ b && b < cmdTailB)
+        if h : cands.size > 0 then
+          let minB := cands.foldl (fun m (b, _) => min m b) cands[0].1
+          let atMin := cands.filterMap (fun (b, n) => if b == minB then some n else none)
+          if h2 : atMin.size > 0 then
+            let primary := atMin.foldl (fun best n =>
+              if n.toString.length < best.toString.length then n else best) atMin[0]
+            -- Take the slice SPAN from the authoritative env range, not from the
+            -- (possibly truncated) parse-only command. The parse-only command
+            -- supplies only the declaration-body boundary, kept only when it lies
+            -- inside the authoritative span (else fall back to a whole-decl slice).
+            match spanByName.get? primary with
+            | some (sB, eB) =>
+              let dvInRange? := match dvB? with
+                | some d => if sB ≤ d && d ≤ eB then some d else none
+                | none => none
+              -- Outermost `by` blocks inside this command, clamped to the
+              -- authoritative declaration span (guards truncated parses).
+              let byRanges := (collectOutermostByTactics cmd).filter
+                (fun (a, b) => sB ≤ a && b ≤ eB)
+              -- 1-indexed source line of the declaration keyword (after any
+              -- leading doc-comment / attributes / modifiers).
+              let kwLine? := (declKeywordPos cmd).map (fun p => (fm.toPosition p).line)
+              nameToCmd := nameToCmd.insert primary
+                { startByte := sB, tailByte := eB, declValByte? := dvInRange?,
+                  byTacticRanges := byRanges, keywordLine := kwLine?,
+                  declNamespace := stackNamespace nsStack }
+            | none => pure ()
+      | _, _ => pure ()
+    else pure ()
+  return some { bytes, nameToCmd, opens, notations, variables, contextCmds }
+
+/-- The body replacement to append to a truncated declaration slice, or `none`
+    to keep the declaration whole (verbatim).
+
+    The downstream consumer re-emits each `source_text` as a copy in a fresh
+    namespace that `import`s the real modules and audits whether DEFINITIONS are
+    STATED correctly. Proof status is irrelevant to that audit, so:
+
+    * Prop-typed decls (theorem/lemma/Prop-valued `def`/`instance`) → ` := by sorry`
+      (their body is a proof, which the audit ignores).
+    * everything else — `def`/`instance`/`opaque` with a non-`Prop` type, `abbrev`,
+      and `structure`/`inductive`/`class` — is kept WHOLE (`none`): the data body,
+      fields, and constructors ARE the audited content.
+    * `axiom` carries no body, so either branch yields its signature only.
+
+    A data body may name a module-`private` helper in a proof field (e.g. a
+    structure-constructing `def` whose `isHermitian` field calls a private lemma).
+    A digest copy cannot resolve that private name, but the resulting elaboration
+    error is localized to that field and does not cascade — and the data body, which
+    is what the audit reads, is shown verbatim regardless. -/
+def truncationSuffix (isProp : Bool) : Option String :=
+  if isProp then some " := by sorry" else none
+
+/-- Rebase the absolute `by`-block byte ranges `si.byTacticRanges` onto the slice
+    that starts at `si.startByte`: subtract the slice start from each endpoint and
+    clamp to `[0, sliceLen]`. The result is a sorted, non-overlapping array of
+    `(start, stop)` BYTE offsets RELATIVE to the start of `source_text`, suitable
+    for the consumer to byte-splice its own elision token (`sorry` / `⋯`) over.
+
+    `sliceLen` is the UTF-8 byte length of the emitted `source_text` (i.e.
+    `tailByte - startByte` for a raw slice). Ranges entirely outside `[0, sliceLen]`
+    after rebasing collapse to empty `(start = stop)` and are dropped. -/
+def rebaseByTacticRanges (si : SliceInfo) (sliceLen : Nat) : Array (Nat × Nat) :=
+  let s0 := si.startByte
+  (si.byTacticRanges.filterMap fun (a, b) =>
+    let a' := (if a ≥ s0 then a - s0 else 0)
+    let b' := (if b ≥ s0 then b - s0 else 0)
+    let a'' := min a' sliceLen
+    let b'' := min b' sliceLen
+    if a'' < b'' then some (a'', b'') else none).qsort (fun x y => x.1 < y.1)
+
+/-- The verbatim `source_text` slice for a declaration plus the slice-relative
+    `by`-block byte ranges to elide.
+
+    * Non-truncated decls (`bodySuffix? = none`: data `def`/`instance`/`opaque`,
+      `abbrev`, `structure`/`inductive`/`class`) → the RAW verbatim slice
+      `bytes[startByte, tailByte)`, returned byte-for-byte with NO token spliced in.
+      The accompanying ranges (`rebaseByTacticRanges`) mark each OUTERMOST `by`
+      block so the consumer can splice its own elision token (`sorry` for a live
+      re-declared copy that must typecheck, `⋯` for a commented digest) — e.g.
+      splicing `⋯` over the three ranges of `DensityOp.fromPure` yields
+      `⟨⟨⟨ψ * ψ.dag, ⋯⟩, ⋯⟩, ⋯⟩`.
+    * Truncated decls (`bodySuffix? = some s`: Prop-typed theorem/lemma/`def`/
+      `instance`) → the statement up to the body boundary (`:=` / `where`) re-closed
+      with `s` (` := by sorry`). These are surfaced via `#check` anyway and carry no
+      source `by` block in their emitted slice, so the ranges are empty. When no body
+      boundary was found, the raw slice is emitted with its `by`-block ranges instead. -/
+def sliceSourceText (bytes : ByteArray) (si : SliceInfo) (bodySuffix? : Option String) :
+    String × Array (Nat × Nat) :=
+  match bodySuffix? with
+  | some suffix =>
+    match si.declValByte? with
+    | some dvB => (dropTrailingWs (sliceBytes bytes si.startByte dvB) ++ suffix, #[])
+    | none =>
+      let text := sliceBytes bytes si.startByte si.tailByte
+      (text, rebaseByTacticRanges si (si.tailByte - si.startByte))
+  | none =>
+    let text := sliceBytes bytes si.startByte si.tailByte
+    (text, rebaseByTacticRanges si (si.tailByte - si.startByte))
+
+/-- Decide whether a declaration's TYPE is a `Prop` (so its body is a proof to be
+    replaced by ` := by sorry`). Covers theorem/lemma and Prop-valued defs/instances. -/
+def isPropTypeIO (env : Environment) (type : Expr) : IO Bool := do
+  match ← runMetaIO env (do return (← Meta.isProp type)) with
+  | .ok b => return b
+  | .error _ => return false
+
 /-- Module filter parsed from CLI args after the root module.
     No args after root → emit every project-local module (`none`).
     Args present → emit only declarations from those modules. -/
@@ -612,6 +1310,11 @@ unsafe def main : List String → IO Unit := fun args => do
   -- Build JSON
   let mut decls : Array Json := #[]
   let mut emittedNames : NameHashSet := {}
+  -- Per-module verbatim scope slices, keyed by module name (modules in the export).
+  let mut moduleOpens : Array (String × Json) := #[]
+  let mut moduleNotations : Array (String × Json) := #[]
+  let mut moduleVariables : Array (String × Json) := #[]
+  let mut moduleContext : Array (String × Json) := #[]
 
   for i in [:mods.size] do
     if mods[i]!.getRoot != rootName then continue
@@ -622,6 +1325,19 @@ unsafe def main : List String → IO Unit := fun args => do
       if !filter.contains mods[i]! then continue
     let md := env.header.moduleData[i]!
     let modStr := mods[i]!.toString
+
+    -- Parse this module's source for verbatim `source_text`/`decl_namespace` and
+    -- collect its open/notation/variable slices. Parsing runs against the single
+    -- global env (no per-module re-import / re-elaboration), so peak memory is
+    -- independent of how many modules the export covers.
+    let mslice? ← parseModuleForSlicing env mods[i]! md.constNames
+    match mslice? with
+    | some ms =>
+      moduleOpens := moduleOpens.push (modStr, .arr (ms.opens.map .str))
+      moduleNotations := moduleNotations.push (modStr, .arr ms.notations)
+      moduleVariables := moduleVariables.push (modStr, .arr (ms.variables.map .str))
+      moduleContext := moduleContext.push (modStr, .arr (ms.contextCmds.map .str))
+    | none => pure ()
 
     for j in [:md.constNames.size] do
       let name := md.constNames[j]!
@@ -647,10 +1363,19 @@ unsafe def main : List String → IO Unit := fun args => do
       -- Collect project deps (type + prop-erased value + fields + ctors)
       let deps ← collectDeps name cinfo
 
-      -- Line number
-      let lineNum : Option Nat := match declRangeExt.find? env name with
-        | some range => some (range.range.pos.line + 1)
-        | none => none
+      -- Line number: 1-indexed source line of the declaration KEYWORD. Prefer the
+      -- parse-only keyword position from this module's slice (skips any leading
+      -- doc-comment / attributes / modifiers); fall back to the env's
+      -- `selectionRange` (the declaration name, on the keyword's line) for
+      -- sub-declarations with no slice. Both are 1-indexed (no `+1`).
+      let sliceForName? := mslice?.bind (·.nameToCmd.get? name)
+      let lineNum : Option Nat :=
+        match sliceForName?.bind (·.keywordLine) with
+        | some l => some l
+        | none =>
+          match declRangeExt.find? env name with
+          | some range => some range.selectionRange.pos.line
+          | none => none
 
       -- Structure fields
       let fieldsJson ← getStructureFields env name globalOpenDecls
@@ -726,6 +1451,25 @@ unsafe def main : List String → IO Unit := fun args => do
       | some doc => jsonFields := jsonFields.push ("docstring", .str doc)
       | none => pure ()
 
+      -- Verbatim source slice + active namespace (additive). Attached to the
+      -- primary declaration of each command; omitted for sub-declarations
+      -- (projections, constructors) that share a command with their parent.
+      match mslice?, sliceForName? with
+      | some ms, some si =>
+        let isProp ← isPropTypeIO env cinfo.type
+        -- Data bodies (`def`/`instance`/`opaque`/`abbrev`/`structure`/…) are kept
+        -- verbatim; only Prop-typed proof bodies are truncated (see `truncationSuffix`).
+        let bodySuffix? := truncationSuffix isProp
+        -- `source_text` is the RAW verbatim slice (no token pre-spliced); the
+        -- `byTactic_ranges` are slice-relative byte offsets the consumer splices
+        -- its own elision token (`sorry` / `⋯`) over.
+        let (text, byRanges) := sliceSourceText ms.bytes si bodySuffix?
+        let byRangesJson := byRanges.map (fun (a, b) => Json.arr #[.num a, .num b])
+        jsonFields := jsonFields.push ("source_text", .str text)
+        jsonFields := jsonFields.push ("byTactic_ranges", .arr byRangesJson)
+        jsonFields := jsonFields.push ("decl_namespace", .str si.declNamespace)
+      | _, _ => pure ()
+
       decls := decls.push <| Json.mkObj jsonFields.toList
 
   -- Canonical project module set: every module reachable from the root via
@@ -733,15 +1477,26 @@ unsafe def main : List String → IO Unit := fun args => do
   -- so this is the authoritative truth Python uses to garbage-collect stale
   -- cache entries that survive a disk walk.
   let mut projectModules : Array Json := #[]
+  -- Direct imports of EVERY project-local module (root == rootName), emitted
+  -- UNFILTERED even under a module filter. Values list both project-local and
+  -- external (Mathlib/Init/Std) imports. Computed from the env header — no parse.
+  let mut moduleImports : Array (String × Json) := #[]
   for i in [:mods.size] do
     if mods[i]!.getRoot == rootName then
       projectModules := projectModules.push (.str mods[i]!.toString)
+      let imps := env.header.moduleData[i]!.imports.map (·.module.toString)
+      moduleImports := moduleImports.push (mods[i]!.toString, .arr (imps.map .str))
 
   let output := Json.mkObj [
     ("root_module", .str rootModuleStr),
     ("declaration_count", .num decls.size),
     ("declarations", .arr decls),
-    ("project_modules", .arr projectModules)
+    ("project_modules", .arr projectModules),
+    ("module_imports", Json.mkObj moduleImports.toList),
+    ("module_opens", Json.mkObj moduleOpens.toList),
+    ("module_notations", Json.mkObj moduleNotations.toList),
+    ("module_variables", Json.mkObj moduleVariables.toList),
+    ("module_context", Json.mkObj moduleContext.toList)
   ]
 
   IO.println output.pretty

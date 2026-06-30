@@ -22,7 +22,29 @@ from typing import Iterable, Optional
 EXPORT_DECLS_LEAN = Path(__file__).resolve().parent / "lean" / "ExportDecls.lean"
 EXPORT_SIGS_LEAN = Path(__file__).resolve().parent / "lean" / "ExportSigs.lean"
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 5
+
+# Per-module maps the exporter emits alongside `declarations`, persisted in the
+# cache so every load path carries them. Each is keyed by module name and merges
+# per-module on a partial export (dropped/re-exported keys replaced, others kept).
+# `project_modules` (a flat list) is handled separately — the exporter emits it
+# over the full canonical set on every export, so it is replaced wholesale.
+#
+# As of schema v4, `module_notations` values are lists of per-notation metadata
+# OBJECTS (`text`/`line`/`kind`/`tokens`/`rhs_idents`) rather than bare verbatim
+# strings; the per-module merge logic here is shape-agnostic (it copies whole
+# values), so no change beyond the schema bump is needed to persist them.
+#
+# As of schema v5, `source_text` is the RAW verbatim slice (no `sorry`
+# pre-spliced over `by` blocks) and each non-truncated declaration carries a
+# per-decl `byTactic_ranges` field — an array of `[start, stop]` BYTE offsets,
+# relative to the start of `source_text`, marking each outermost `by` block. The
+# consumer byte-splices its own elision token (`sorry` for live re-declared
+# copies, `⋯` for commented digests) over these ranges. Both fields live inside
+# each declaration dict, which the per-module declaration merge copies wholesale,
+# so the schema bump (which forces a full re-export) is the only change needed.
+_PERMODULE_TOPLEVEL_MAPS = ("module_imports", "module_opens", "module_notations",
+                            "module_variables")
 
 
 def run_lean_export(
@@ -168,23 +190,30 @@ def _diff_modules(
 # Cache shape (v2)
 # ---------------------------------------------------------------------------
 
-def _new_v2_cache(
+def _new_cache(
     root_module: str,
     exporter_mtime: float,
     module_mtimes: dict[str, float],
     declarations: list,
+    data: dict,
 ) -> dict:
-    return {
+    """Build a fresh cache at the current ``SCHEMA_VERSION``. ``data`` is the raw
+    exporter payload, used to pull the top-level scope/import maps."""
+    cache = {
         "schema_version": SCHEMA_VERSION,
         "root_module": root_module,
         "exporter_mtime": exporter_mtime,
         "module_mtimes": dict(module_mtimes),
         "declaration_count": len(declarations),
         "declarations": list(declarations),
+        "project_modules": list(data.get("project_modules", [])),
     }
+    for key in _PERMODULE_TOPLEVEL_MAPS:
+        cache[key] = dict(data.get(key, {}))
+    return cache
 
 
-def _is_v2(cache: dict) -> bool:
+def _is_current(cache: dict) -> bool:
     return cache.get("schema_version") == SCHEMA_VERSION
 
 
@@ -232,7 +261,7 @@ def _merge_cache(
         module_mtimes[m] = current_mtimes[m]
 
     merged = list(kept) + new_decls
-    return {
+    result = {
         "schema_version": SCHEMA_VERSION,
         "root_module": old["root_module"],
         "exporter_mtime": old["exporter_mtime"],
@@ -240,6 +269,24 @@ def _merge_cache(
         "declaration_count": len(merged),
         "declarations": merged,
     }
+
+    # project_modules: the exporter reports the full canonical set on every
+    # export (incl. partial), so prefer the partial's value when present.
+    if "project_modules" in partial:
+        result["project_modules"] = list(partial["project_modules"])
+    elif canonical_modules is not None:
+        result["project_modules"] = sorted(canonical_modules)
+    else:
+        result["project_modules"] = list(old.get("project_modules", []))
+
+    # Per-module scope/import maps: drop stale keys, overlay the partial's.
+    for key in _PERMODULE_TOPLEVEL_MAPS:
+        old_map = old.get(key, {})
+        kept_map = {m: v for m, v in old_map.items() if m not in drop}
+        kept_map.update(partial.get(key, {}))
+        result[key] = kept_map
+
+    return result
 
 
 def _write_cache(cache_path: Path, cache: dict) -> None:
@@ -289,7 +336,7 @@ def export_cached(
         except (json.JSONDecodeError, OSError):
             cache = None
 
-    if cache is None or not _is_v2(cache):
+    if cache is None or not _is_current(cache):
         return _do_full_export(
             lake_root, root_module, cache_path, export_lean, timeout, exporter_mtime,
             reason=("no cache" if cache is None else "cache schema mismatch"),
@@ -380,11 +427,12 @@ def _do_full_export(
         module_mtimes = {m: t for m, t in disk_mtimes.items() if m in canonical}
     else:
         module_mtimes = disk_mtimes
-    cache = _new_v2_cache(
+    cache = _new_cache(
         root_module=root_module,
         exporter_mtime=exporter_mtime,
         module_mtimes=module_mtimes,
         declarations=data.get("declarations", []),
+        data=data,
     )
     _write_cache(cache_path, cache)
     print(

@@ -110,11 +110,12 @@ def test_diff_modules_empty_when_no_changes() -> None:
 
 
 def test_merge_cache_preserves_unchanged_modules() -> None:
-    old = exp._new_v2_cache(
+    old = exp._new_cache(
         root_module="Proj",
         exporter_mtime=1.0,
         module_mtimes={"Proj.A": 100.0, "Proj.B": 200.0},
         declarations=[_decl("Proj.A.foo", "Proj.A"), _decl("Proj.B.bar", "Proj.B")],
+        data={},
     )
     partial = {"declarations": [_decl("Proj.B.baz", "Proj.B")]}
     current = {"Proj.A": 100.0, "Proj.B": 250.0}
@@ -127,11 +128,12 @@ def test_merge_cache_preserves_unchanged_modules() -> None:
 
 
 def test_merge_cache_drops_deletions() -> None:
-    old = exp._new_v2_cache(
+    old = exp._new_cache(
         root_module="Proj",
         exporter_mtime=1.0,
         module_mtimes={"Proj.A": 100.0, "Proj.B": 200.0},
         declarations=[_decl("Proj.A.foo", "Proj.A"), _decl("Proj.B.bar", "Proj.B")],
+        data={},
     )
     partial = {"declarations": []}
     current = {"Proj.A": 100.0}  # Proj.B removed

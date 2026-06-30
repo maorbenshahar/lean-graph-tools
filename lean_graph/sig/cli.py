@@ -15,8 +15,8 @@ from ..common import (
     log,
 )
 from ..export import EXPORT_SIGS_LEAN, export_cached, load_from_file
-from .tracker import build_index, dep_closure
-from .render import render_context
+from .tracker import SigData, build_index, dep_closure
+from .render import comparator_config, render_context, render_digest
 
 
 def main(argv: Optional[list[str]] = None) -> None:
@@ -45,6 +45,41 @@ def main(argv: Optional[list[str]] = None) -> None:
                         help="Show only target declarations, skip dependencies")
     parser.add_argument("--rebuild-cache", action="store_true",
                         help="Force a full re-export instead of the incremental partial rebuild")
+    parser.add_argument("--comparator", action="store_true",
+                        help="Emit a leanprover/comparator Challenge (import real deps; "
+                             "targets sorried) plus a sibling config.json")
+    parser.add_argument("--print", dest="print_mode", action="store_true",
+                        help="Render the 'print' digest (this is the DEFAULT): import the "
+                             "real closure modules, show a dependency tree + per-decl "
+                             "docstring + verbatim source slice + #check/#print of the "
+                             "imported decl (elaborated ground truth, for comparison).")
+    parser.add_argument("--no-source", dest="no_source", action="store_true",
+                        help="In 'print' mode, omit the authored source slice (keep the "
+                             "dependency tree + #check/#print only).")
+    parser.add_argument("--self-contained", dest="self_contained", action="store_true",
+                        help="Render the standalone self-contained mini-library (closure "
+                             "re-declared as live source, compiles without the library) "
+                             "instead of the default 'print' digest.")
+    parser.add_argument("--connected", action="store_true",
+                        help="Render the 'connected' mini-replica (one Audit namespace, "
+                             "closure wired leaf-first) instead of the default self-contained "
+                             "mini-library. Breaks on project notation.")
+    parser.add_argument("--import-copies", dest="import_copies", action="store_true",
+                        help="Fallback render: each decl isolated in its own namespace "
+                             "(target first), resolving to the real imports. Compiles even "
+                             "for notation-heavy closures, but decls aren't wired together. "
+                             "Default is the self-contained mini-library.")
+    parser.add_argument("--config-out", type=str,
+                        help="Path for the comparator config.json (default: config.json "
+                             "beside -o)")
+    parser.add_argument("--challenge-module", type=str,
+                        help="Override the comparator config challenge_module")
+    parser.add_argument("--permitted-axioms", type=str,
+                        default="Classical.choice,Quot.sound,propext",
+                        help="Comma-separated permitted axioms for comparator config.json")
+    parser.add_argument("--legacy-render", action="store_true",
+                        help="Use the old pretty-printed pseudo-Lean output instead of the "
+                             "source-faithful digest")
     add_export_timeout_arg(parser)
 
     args = parser.parse_args(argv)
@@ -72,7 +107,10 @@ def main(argv: Optional[list[str]] = None) -> None:
         Path(args.save).write_text(json.dumps(data, indent=2) + "\n")
         log(f"Saved to {args.save}")
 
-    index = build_index(data)
+    sig = SigData(data)
+    index = sig.index
+    if not root_module:
+        root_module = sig.root_module
 
     # Find target declarations
     if args.file:
@@ -126,17 +164,46 @@ def main(argv: Optional[list[str]] = None) -> None:
                     **({"value": d.value} if d.value else {}),
                     **({"parents": d.parents} if d.parents else {}),
                     **({"has_sorry": True} if d.has_sorry else {}),
+                    **({"source_text": d.source_text} if d.source_text else {}),
+                    **({"decl_namespace": d.decl_namespace} if d.decl_namespace else {}),
                 }
                 for d in closure
             ],
         }
         output = json.dumps(result, indent=2)
-    else:
+    elif args.legacy_render:
         output = render_context(
             targets=targets,
             context=closure,
             root_module=root_module,
             header=header,
+        )
+    else:
+        if not sig.has_source_text:
+            print("ERROR: this export predates the source-slice fields (no source_text). "
+                  "Re-run without --load, or with --rebuild-cache, to regenerate the cache; "
+                  "or pass --legacy-render for the old pretty-printed output.",
+                  file=sys.stderr)
+            sys.exit(1)
+        mode = ("comparator" if args.comparator
+                else "import_copies" if args.import_copies
+                else "connected" if args.connected
+                else "self_contained" if args.self_contained
+                else "print")
+        output = render_digest(
+            targets=targets,
+            closure=closure,
+            index=index,
+            root_module=root_module,
+            module_imports=sig.module_imports,
+            module_opens=sig.module_opens,
+            module_notations=sig.module_notations,
+            module_variables=sig.module_variables,
+            module_context=sig.module_context,
+            project_modules=sig.project_modules,
+            mode=mode,
+            header=header,
+            show_source=not args.no_source,
         )
 
     if args.output:
@@ -144,6 +211,24 @@ def main(argv: Optional[list[str]] = None) -> None:
         log(f"Written to {args.output}")
     else:
         print(output)
+
+    # Comparator: emit the sibling config.json next to the digest.
+    if args.comparator and not args.json and not args.legacy_render:
+        if args.config_out:
+            config_path = Path(args.config_out)
+        elif args.output:
+            config_path = Path(args.output).with_name("config.json")
+        else:
+            config_path = Path("config.json")
+        challenge_module = args.challenge_module or (
+            Path(args.output).stem.split(".")[0] if args.output else "Challenge")
+        cfg = comparator_config(
+            targets, closure,
+            challenge_module=challenge_module,
+            permitted_axioms=[a.strip() for a in args.permitted_axioms.split(",") if a.strip()],
+        )
+        config_path.write_text(json.dumps(cfg, indent=2) + "\n")
+        log(f"Wrote comparator config to {config_path}")
 
 
 if __name__ == "__main__":
