@@ -798,6 +798,49 @@ def _token_present(token: str, blob: str) -> bool:
     return t in blob
 
 
+_IDENT_WORD_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_']*$")
+
+
+def _atom_used_as_binder(atom: str, blob: str) -> bool:
+    """True if an identifier-word notation atom (`X`, `Z`, `H`, …) appears in a
+    BINDER position in the shown sources.
+
+    In the flattened mini-library the import isolation that lets a single-word
+    notation token coexist with a same-named binder in the real library is gone:
+    re-declaring `notation "X" => pauliX` turns `X` into a keyword token, which
+    then breaks every later `(X : …)`, `∃ X : …, …`, or structure param `(S X Z :
+    Type*)`. Only identifier-word atoms can collide this way; symbolic atoms
+    (`⊗`, `|0⟩`, `†`) never can, so they short-circuit to False.
+
+    Detects the two binder shapes that occur in a signature: a parenthesized/
+    bracketed binder group `([{⦃ … X … :` (before any closing delim or `:`), and a
+    `∀`/`∃`/`λ`/`fun` binder `… X … ,` / `… X … =>`.
+    """
+    if not _IDENT_WORD_RE.match(atom):
+        return False
+    esc = re.escape(atom)
+    grp = r"[A-Za-z0-9_'⟨⟩]+"
+    # `(… X … :` inside a paren/brace/instance binder group, before any `)`/`:`.
+    paren = re.compile(r"[\[({⦃][^)}\]:]*?(?<![A-Za-z0-9_'])" + esc
+                       + r"(?![A-Za-z0-9_'])[^)}\]:]*?:")
+    # `∀`/`∃`/`λ`/`Σ`/`Π`/`fun` … X … `,`/`=>`.
+    quant = re.compile(r"(?:[∀∃λΣΠ]|\bfun\b)\s*(?:" + grp + r"\s+)*" + esc
+                       + r"\b[^,=]*(?:,|=>)")
+    return bool(paren.search(blob) or quant.search(blob))
+
+
+def _receiver_type_head(recv: str, body: str) -> str | None:
+    """Short type head of the local variable `recv` from its binder in `body`.
+
+    Finds a binder group `([{⦃ … recv … : TypeHead …` and returns the last segment
+    of `TypeHead` (`(atk : GeneralAttackLinear 4 n)` -> ``"GeneralAttackLinear"``).
+    Used to resolve a dot-notation call `recv.method` to the single overload on
+    that type, without pulling every same-named overload (which would cascade)."""
+    m = re.search(r"[(\[{⦃][^:)}\]]*?(?<![A-Za-z0-9_'])" + re.escape(recv)
+                  + r"(?![A-Za-z0-9_'])[^:)}\]]*?:\s*@?([A-Za-z_][A-Za-z0-9_.']*)", body)
+    return m.group(1).rsplit(".", 1)[-1] if m else None
+
+
 def _resolve_idents(raw_idents, index: dict[str, DeclInfo]) -> set[str]:
     """Map raw (unqualified or partially-qualified) idents to project FQNs by
     suffix match against the decl index. Mathlib idents simply don't match."""
@@ -842,6 +885,14 @@ def _select_notations(
             if _NONTERM_CAT_RE.search(meta["text"]):
                 continue
             atoms = [t for t in meta["tokens"] if t.strip()]
+            # A single-word notation token that also appears as a BINDER in the
+            # shown sources would shadow that binder once re-declared and break
+            # parsing in the flattened file (the Gates `X`/`Z` block over the
+            # `(X : …)` binders in `diamondNorm`/`mapTensorId`/`QuantumHashFamily`).
+            # Drop it — it is sugar for a named def that is itself re-declared, and
+            # a signature audit never needs the letter-notation.
+            if any(_atom_used_as_binder(t, blob) for t in atoms):
+                continue
             tokens_ok = bool(atoms) and all(_token_present(t, blob) for t in atoms)
             rhs_hit = bool(_resolve_idents(meta["rhs_idents"], index) & member_names)
             if tokens_ok or rhs_hit:
@@ -958,33 +1009,61 @@ def _expand_and_select(
                     members[dep] = index[dep]
                     added = True
 
-        # Source-text references not tracked in `deps`: dot-notation methods like
-        # `attack.neZeroEveDim` are prop-erased from a def's recorded deps. With
-        # by-elision the slices no longer contain proof idents, so matching the
-        # data-position idents (and the last segment of a dotted `recv.method`) is
-        # safe. Over-matches on common segments resolve to filtered projections or
-        # already-present decls, so they don't bloat the closure meaningfully.
-        # Data references in def bodies are already in `deps` (by-elision stripped
-        # the proof refs), so the only gap is dot-notation methods prop-erased from
-        # deps, like `attack.neZeroEveDim`. Resolve just the last segment of a
-        # dotted `recv.method`, and only when unambiguous (≤3 decls share the name)
-        # — `neZeroEveDim` resolves to 2, but `toOp`/`trace`/`mk` resolve to dozens
-        # and would bloat (and dilute) the audit, so they're left to dot-notation
-        # on the already-present receiver type.
-        seg_idents: set[str] = set()
-        for d in members.values():
+        # Source-text references not tracked in `deps`. A shown non-theorem body is
+        # emitted VERBATIM (proofs `by`-elided to `sorry`), so every identifier that
+        # survives elision must be re-declared or it is an unknown identifier. Two
+        # kinds are prop-erased from a def's recorded `deps` and so are invisible to
+        # the pass above: (a) TERM-mode proof fields, e.g.
+        # `map_add' := (mapTensorId_isLinearMap Φ).map_add`, and (b) dot-notation
+        # methods, e.g. `atk.neZeroEveDim`. Recover them from the EMITTED text.
+        #
+        # Resolve each source ident to project decl(s) and pull it (emitted
+        # sorried). Bloat guards: a plain unqualified ident is pulled only when it
+        # resolves UNIQUELY (`mapTensorId_isLinearMap`, `bb84BaseOutputDim_neZero`);
+        # a dotted `recv.method` keeps the overload(s) whose receiver TYPE is already
+        # shown (`neZeroEveDim` -> the `GeneralAttack{,Linear}` overloads, not
+        # `BobEveAttackLinear`), else falls back to the old ≤3-unambiguous rule; a
+        # plain AMBIGUOUS ident (`toOp`, `trace`, `mk`) is left to dot-notation on
+        # its already-present receiver type.
+        # Only PROOF-producing helpers (theorem/lemma) are recovered here: those are
+        # exactly the refs prop-erased from `deps` (a term-mode proof field or a
+        # `haveI := recv.method`), and a sorried theorem drags no body — whereas
+        # pulling a def/structure/instance this way would drag its fields/value and
+        # cascade through unrelated hierarchies (the CSS Pauli algebra, the attack
+        # zoo, the CQState reference machinery). Data refs are real type-deps and
+        # are handled by the `deps`/type-closure passes.
+        for d in list(members.values()):
             if d.kind in _THEOREM_KINDS:
                 continue
-            for raw in _IDENT_RE.findall(_strip_comments(d.source_text or "")):
-                if "." in raw:
-                    seg_idents.add(raw.rsplit(".", 1)[-1])
-        for seg in seg_idents:
-            matches = suffix_map.get(seg, set())
-            if 0 < len(matches) <= 3:
-                for n in matches:
-                    if n not in members and n in index:
-                        members[n] = index[n]
-                        added = True
+            body = _strip_comments(_apply_elision(d, "sorry"))
+            for raw in _IDENT_RE.findall(body):
+                if raw in _RHS_NOISE or raw in members:
+                    continue
+                seg = raw.rsplit(".", 1)[-1]
+                cands = {raw} if raw in index else {
+                    m for m in suffix_map.get(seg, set()) if m in index} - set(members)
+                cands = {c for c in cands if index[c].kind in _THEOREM_KINDS}
+                if not cands:
+                    continue
+                if len(cands) == 1:
+                    pick = next(iter(cands))
+                elif "." in raw:
+                    # dotted `recv.method`: keep the overload whose receiver type
+                    # matches `recv`'s binder type in THIS body (`atk :
+                    # GeneralAttackLinear` -> `GeneralAttackLinear.neZeroEveDim`, not
+                    # the sibling `SymmetrizedAttack`/`BobEveAttackLinear` overloads,
+                    # which would each drag their attack structure).
+                    recv = raw.rsplit(".", 1)[0].rsplit(".", 1)[-1]
+                    th = _receiver_type_head(recv, body)
+                    typed = {c for c in cands
+                             if c.rsplit(".", 1)[0].rsplit(".", 1)[-1] == th} if th else set()
+                    if len(typed) != 1:
+                        continue
+                    pick = next(iter(typed))
+                else:
+                    continue
+                members[pick] = index[pick]
+                added = True
 
         # Type-level closure: statement deps of the (sorried) theorems just pulled,
         # plus implicit type arguments not named verbatim.

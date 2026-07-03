@@ -9,6 +9,7 @@ These tests exercise the live digest renderers, which build from the verbatim
 from lean_graph.sig.tracker import DeclInfo, FieldInfo
 from lean_graph.sig.render import (
     _apply_elision,
+    _atom_used_as_binder,
     _projection_names,
     _render_decl_source,
     render_digest,
@@ -98,3 +99,60 @@ def test_render_digest_self_contained_imports_mathlib_and_sorries_proofs():
     assert "def leaf : Nat := 0" in out  # leaf re-declared verbatim
     assert "namespace Foo" in out        # placed under its real namespace
     assert "sorry" in out                # the theorem body is sorried
+
+
+def test_atom_used_as_binder_flags_only_binder_positions():
+    # Identifier-word atoms in binder positions (parenthesized, instance-bracket,
+    # ∀/∃/fun) would shadow the binder once re-declared as notation.
+    assert _atom_used_as_binder("X", "def f (X : Op n) : Op n := X")
+    assert _atom_used_as_binder("X", "theorem t : ∃ X : Op n, P X := by sorry")
+    assert _atom_used_as_binder("Z", "structure H (S X Z : Type*) where")
+    assert _atom_used_as_binder("Y", "def g := fun Y => Y + 1")
+    # Symbolic atoms can never collide with a binder.
+    assert not _atom_used_as_binder("⊗", "def f := a ⊗ b")
+    assert not _atom_used_as_binder("|0⟩", "def f := |0⟩")
+    # A term-only occurrence is not a binder.
+    assert not _atom_used_as_binder("X", "def f := gateI * X")
+
+
+def test_self_contained_drops_binder_colliding_notation():
+    # `notation "X" => pauliX` from one module would, in the flattened file, shadow
+    # the `(X : Op 2)` binder in another module and break parsing. It is dropped,
+    # while a symbolic notation that cannot collide is kept.
+    gate = _decl("Q.pauliX", "def", "Q.Gates",
+                 source_text="def pauliX : Op 2 := 0", decl_namespace="Q")
+    user = _decl("Q.f", "def", "Q.Main", deps=["Q.pauliX"],
+                 source_text="def f (X : Op 2) : Op 2 := X ⊗ X", decl_namespace="Q")
+    index = {d.name: d for d in (gate, user)}
+    out = render_digest(
+        [user], [user, gate], index, root_module="Q",
+        module_imports={"Q.Gates": [], "Q.Main": ["Q.Gates"]},
+        project_modules={"Q.Gates", "Q.Main"},
+        module_notations={"Q.Gates": [
+            {"text": 'notation "X" => pauliX', "line": 5,
+             "tokens": ["X"], "rhs_idents": ["pauliX"]},
+            {"text": 'infixl:70 " ⊗ " => tensor', "line": 6,
+             "tokens": ["⊗"], "rhs_idents": ["tensor"]},
+        ]},
+        mode="self_contained",
+    )
+    assert 'notation "X"' not in out       # binder-colliding word notation -> dropped
+    assert "⊗" in out                       # symbolic notation -> kept
+
+
+def test_self_contained_recovers_prop_erased_proof_helper():
+    # `f`'s body references lemma `aux` in a term position, but `aux` is prop-erased
+    # from `f.deps`; the self-contained closure must still re-declare it or the
+    # flattened file has an unknown identifier.
+    aux = _decl("Q.aux", "theorem", "Q.Aux",
+                source_text="theorem aux : True := by sorry", decl_namespace="Q")
+    f = _decl("Q.f", "def", "Q.Main", deps=[],   # aux deliberately absent from deps
+              source_text="def f : Nat := (aux).elim 0", decl_namespace="Q")
+    index = {d.name: d for d in (aux, f)}
+    out = render_digest(
+        [f], [f], index, root_module="Q",
+        module_imports={"Q.Aux": [], "Q.Main": ["Q.Aux"]},
+        project_modules={"Q.Aux", "Q.Main"},
+        mode="self_contained",
+    )
+    assert "theorem aux" in out            # recovered despite absence from `deps`
