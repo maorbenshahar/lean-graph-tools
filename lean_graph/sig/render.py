@@ -714,6 +714,15 @@ from .tracker import dep_closure
 
 _QUOTED_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
 _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.']*")
+# Body-scan tokenizer for recovering proof-helper refs from an emitted decl body.
+# Unlike `_IDENT_RE` (ASCII-only, for notation RHS), this is Unicode-aware: Lean
+# identifiers routinely start with a non-ASCII letter (`ρ`, `σ`, `τ`, …) or embed
+# one (`hεcor0`). If the receiver of a dot-call is dropped by an ASCII-only match,
+# `ρ.method` collapses to a bare `method` that can no longer be receiver-type
+# disambiguated and misresolves via the global suffix map (this is how a
+# `LinearMap.comp` call pulled in the unrelated `IsCPTNI.comp`). `[^\W\d]` starts
+# on any Unicode word char that is not a digit; `re` is Unicode-aware by default.
+_BODY_IDENT_RE = re.compile(r"[^\W\d][\w.']*")
 # Lean syntax words that show up in a notation RHS / macro expansion but are never
 # project decls — skip them when recovering rhs idents from raw text.
 _RHS_NOISE = {
@@ -1036,7 +1045,17 @@ def _expand_and_select(
             if d.kind in _THEOREM_KINDS:
                 continue
             body = _strip_comments(_apply_elision(d, "sorry"))
-            for raw in _IDENT_RE.findall(body):
+            for m in _BODY_IDENT_RE.finditer(body):
+                raw = m.group(0)
+                # A token still bare after Unicode-aware tokenization yet immediately
+                # preceded by `.` is a dot-call on a NON-identifier receiver, e.g.
+                # `(Φ.comp Ψ).comp` -> bare `comp` (receiver is `)`). Lean resolves it
+                # through the receiver's type, so it is never a standalone short-name
+                # reference; suffix-matching it against project theorems by last
+                # segment is unsound. (Identifier receivers — incl. Unicode `ρ.method`
+                # — are now captured whole and handled by the dotted branch below.)
+                if m.start() > 0 and body[m.start() - 1] == ".":
+                    continue
                 if raw in _RHS_NOISE or raw in members:
                     continue
                 seg = raw.rsplit(".", 1)[-1]
