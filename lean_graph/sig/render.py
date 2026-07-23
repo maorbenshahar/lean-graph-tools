@@ -852,16 +852,30 @@ def _receiver_type_head(recv: str, body: str) -> str | None:
 
 def _resolve_idents(raw_idents, index: dict[str, DeclInfo]) -> set[str]:
     """Map raw (unqualified or partially-qualified) idents to project FQNs by
-    suffix match against the decl index. Mathlib idents simply don't match."""
+    suffix match against the decl index. Mathlib idents simply don't match.
+
+    A BARE (un-dotted) ident never resolves to a structure-field projection:
+    real source references a field through a receiver (`p.n`) or fully
+    qualified, so a bare suffix match is a binder/pattern variable colliding
+    with a field name — e.g. a notation-RHS variable `n` matching
+    `bb84EurParams.n`, the only `.n`-suffixed decl in the index, which then
+    phantom-injects the whole parent structure into the digest."""
+    projections: set[str] = set()
+    for d in index.values():
+        if d.fields:
+            for f in d.fields:
+                if f.proj_name:
+                    projections.add(f.proj_name)
     out: set[str] = set()
     keys = list(index.keys())
     for raw in raw_idents:
         if raw in index:
             out.add(raw)
             continue
+        bare = "." not in raw
         suf = "." + raw
         for k in keys:
-            if k.endswith(suf):
+            if k.endswith(suf) and not (bare and k in projections):
                 out.add(k)
     return out
 
@@ -968,6 +982,20 @@ def _expand_and_select(
         for i in range(len(parts)):
             suffix_map[".".join(parts[i:])].add(fqn)
 
+    # Structure-field projections across the whole index. Real source never
+    # references a projection by BARE last segment — field access is written
+    # with a receiver (`p.hn`, `ρ.pos_semidef`) or fully qualified — so a bare
+    # body token matching a projection is a LOCAL BINDER NAME (`hn`, `hεcor0`,
+    # `ℓ` …). Suffix-matching it would phantom-inject the projection and (via
+    # its statement deps) its parent structure: cf. `bb84EurParams`, every one
+    # of whose Prop fields is a globally-unique suffix and a common binder name.
+    projection_decls: set[str] = set()
+    for d in index.values():
+        if d.fields:
+            for f in d.fields:
+                if f.proj_name:
+                    projection_decls.add(f.proj_name)
+
     def satisfied(dep: str) -> bool:
         # A dep is "available" if shown, external (Mathlib), or an auto-generated
         # projection/constructor (no source slice — it arrives with its structure).
@@ -1062,6 +1090,10 @@ def _expand_and_select(
                 cands = {raw} if raw in index else {
                     m for m in suffix_map.get(seg, set()) if m in index} - set(members)
                 cands = {c for c in cands if index[c].kind in _THEOREM_KINDS}
+                if "." not in raw:
+                    # Bare tokens never reference projections (see above); dotted
+                    # `recv.field` references stay eligible via the typed branch.
+                    cands -= projection_decls
                 if not cands:
                     continue
                 if len(cands) == 1:
@@ -1225,14 +1257,29 @@ def _render_self_contained(
     # later (or within the same module). Re-declaring decls means the namespaces
     # don't exist until their decls are emitted; an `open` registers a search
     # path, so decls added after it are still found.
-    all_ns = sorted({d.decl_namespace for d in members if d.decl_namespace})
+    #
+    # Also forward-declare every namespace referenced by a KEPT open: a module
+    # may open a namespace none of whose decls are re-declared here (e.g.
+    # `open InfoTheory.Security` in a module whose selected decl lives
+    # elsewhere). The re-declared mini-library never creates that namespace, so
+    # the open would fail with `unknown namespace`. An empty forward declaration
+    # is required for such project namespaces and harmless for Mathlib ones
+    # (they already exist).
+    module_order = _module_import_order(closure_modules, module_imports, project_modules)
+    kept_opens = {mod: _filter_opens(module_opens.get(mod, []), project_ns, populated_ns)
+                  for mod in module_order}
+    ns_set = {d.decl_namespace for d in members if d.decl_namespace}
+    for opens_list in kept_opens.values():
+        for o in opens_list:
+            ns_set.update(_open_referenced_namespaces(o))
+    all_ns = sorted(ns_set)
     if all_ns:
         lines.append("-- Forward-declared namespaces (so cross-module opens resolve).")
         for ns in all_ns:
             lines.append(f"namespace {ns} end {ns}")
         lines.append("")
 
-    for mod in _module_import_order(closure_modules, module_imports, project_modules):
+    for mod in module_order:
         decls = by_module[mod]
         mshort = module_short(mod, root_module)
         lines.append(f"-- {'═' * 4} from {mshort} {'═' * 4}")
@@ -1241,7 +1288,7 @@ def _render_self_contained(
         # not the module's primary one — a module can define decls in foreign
         # namespaces (e.g. `Quantum.Operators.DensityOp.tensor` lives in module
         # `Quantum.TensorProducts.Basic`), and the re-declared name must match.
-        opens = _filter_opens(module_opens.get(mod, []), project_ns, populated_ns)
+        opens = kept_opens[mod]
         for opn in opens:
             lines.append(opn)
         for var in module_variables.get(mod, []):
